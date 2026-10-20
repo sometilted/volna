@@ -1,10 +1,23 @@
 #!/bin/bash
 # Установка и обновление Volna одной командой:
 #   curl -fsSL https://raw.githubusercontent.com/sometilted/volna/main/install.sh | bash
-# Кладёт Volna.app в /Applications и запускает. Старую YaNotch (прежнее имя) закрывает и удаляет —
-# вход и настройки Volna заберёт из неё сама. Ничего не ставит в автозапуск.
+# Админ — ставит в /Applications. Обычный пользователь — в ~/Applications (без пароля,
+# и обновления потом тоже ставятся без пароля). Бета-версию под именем YaNotch удаляет,
+# вход и настройки Volna переносит сама. Ничего не ставит в автозапуск.
 set -e
 REPO="sometilted/volna"
+
+# удалить бандл; если не хватает прав — системное окно с логином и паролем администратора
+rm_app() {
+  local p="$1"
+  [ -e "$p" ] || return 0
+  rm -rf "$p" 2>/dev/null && return 0
+  osascript -e "do shell script \"rm -rf '$p'\" with administrator privileges" >/dev/null 2>&1 && return 0
+  echo "[Не удалось удалить] $p — удали вручную"
+}
+
+if [ -w /Applications ]; then DEST="/Applications"; else DEST="$HOME/Applications"; mkdir -p "$DEST"; fi
+
 URL=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
   | grep -oE '"browser_download_url": *"[^"]+\.zip"' | head -1 | sed -E 's/.*"(https[^"]+)"/\1/')
 [ -n "$URL" ] || { echo "[Ошибка] не нашёл релиз в $REPO"; exit 1; }
@@ -14,15 +27,18 @@ curl -fsSL "$URL" -o "$T/volna.zip"
 ditto -x -k "$T/volna.zip" "$T"
 [ -d "$T/Volna.app" ] || { echo "[Ошибка] в архиве нет Volna.app"; exit 1; }
 
-if pgrep -x YaNotch >/dev/null || [ -d /Applications/YaNotch.app ] || [ -d "$HOME/Applications/YaNotch.app" ]; then
-  pkill -x YaNotch 2>/dev/null || true
-  rm -rf /Applications/YaNotch.app "$HOME/Applications/YaNotch.app"
-  echo "[Удалена] старая YaNotch — вход и настройки Volna перенесёт сама"
-fi
-
+# бета-версия (YaNotch) и копии Volna в другой папке приложений
+pkill -x YaNotch 2>/dev/null || true
 pkill -x Volna 2>/dev/null || true
 sleep 0.5
-rm -rf /Applications/Volna.app
-mv "$T/Volna.app" /Applications/
-open /Applications/Volna.app
-echo "[Готово] Volna $(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' /Applications/Volna.app/Contents/Info.plist) в «Программах» и запущена — наведи мышь на нотч"
+for p in /Applications/YaNotch.app "$HOME/Applications/YaNotch.app"; do
+  [ -e "$p" ] && { rm_app "$p"; echo "[Удалена] бета-версия: $p"; }
+done
+for p in /Applications/Volna.app "$HOME/Applications/Volna.app"; do
+  [ "$p" = "$DEST/Volna.app" ] || rm_app "$p"
+done
+
+rm -rf "$DEST/Volna.app"
+mv "$T/Volna.app" "$DEST/"
+open "$DEST/Volna.app"
+echo "[Готово] Volna $(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$DEST/Volna.app/Contents/Info.plist") → $DEST — наведи мышь на нотч"
