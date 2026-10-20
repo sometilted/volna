@@ -1,0 +1,9 @@
+.build/
+.swiftpm/
+Volna.app/
+dist/
+*.dmg
+*.zip
+*.sig
+.build.log
+.DS_Store
