@@ -126,7 +126,13 @@ final class Updater: ObservableObject {
         sv.hasVerticalScroller = true
         sv.drawsBackground = false
         let tv = NSTextView(frame: sv.bounds)
-        tv.string = r.notes.isEmpty ? "—" : r.notes
+        // markdown из релиза показываем чистым текстом: без **, ` и ``` (списки «- » оставляем)
+        let clean = r.notes
+            .replacingOccurrences(of: "```", with: "")
+            .replacingOccurrences(of: "**", with: "")
+            .replacingOccurrences(of: "`", with: "")
+            .replacingOccurrences(of: "\n- ", with: "\n• ")
+        tv.string = clean.isEmpty ? "—" : (clean.hasPrefix("- ") ? "• " + clean.dropFirst(2) : clean)
         tv.isEditable = false
         tv.drawsBackground = false
         tv.font = .systemFont(ofSize: 12)
