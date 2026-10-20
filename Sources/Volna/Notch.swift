@@ -231,12 +231,14 @@ final class NotchController: MenuSource {
         let a = actions
         m.add("Запускать при входе", checked: p.launchAtLogin) { a.setLaunchAtLogin(!p.launchAtLogin) }
         m.addItem(.separator())
-        m.add("Войти через Яндекс", a.login)
-        m.add("Вставить токен из буфера", a.pasteToken)
-        if player.loggedIn { m.add("Выйти из аккаунта", a.logout) }
+        if player.loggedIn {
+            m.add("Выйти из аккаунта", a.logout)
+        } else {
+            m.add("Войти через Яндекс", a.login)
+            m.add("Вставить токен из буфера", a.pasteToken)
+        }
         m.addItem(.separator())
         m.add("Проверить обновления") { up.check(manual: true) }
-        m.add("Отладка: снять меню-бар (Live Activities)") { AXProbe.run() }
         let ver = NSMenuItem(title: "Volna \(Updater.current)", action: nil, keyEquivalent: "")
         ver.isEnabled = false
         m.addItem(ver)

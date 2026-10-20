@@ -7,12 +7,12 @@ enum UIStyle: String, CaseIterable {
 
     var title: String {
         switch self {
-        case .classic: "Классика"
-        case .impeccable: "Impeccable — сдержанно, нативно"
-        case .taste: "Taste — волна и цвет обложки"
-        case .emil: "Emil — движение"
-        case .candy: "Конфетка — вид Impeccable, движение Emil"
-        case .designer: "Дизайн — макет из Figma"
+        case .classic: "Штиль"
+        case .impeccable: "Глубина"
+        case .taste: "Закат"
+        case .emil: "Течение"
+        case .candy: "Прилив"
+        case .designer: "@opiatolove"
         }
     }
 }
