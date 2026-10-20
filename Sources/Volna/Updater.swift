@@ -96,7 +96,10 @@ final class Updater: ObservableObject {
             ylog("update: в релизе \(tag) нет zip/sig")
             return nil
         }
-        return Release(version: tag, notes: j["body"] as? String ?? "",
+        // всё после «---» в тексте релиза — для страницы GitHub (команда установки), в окне обновления не показываем
+        let body = j["body"] as? String ?? ""
+        let notes = (body.components(separatedBy: "\n---").first ?? body).trimmingCharacters(in: .whitespacesAndNewlines)
+        return Release(version: tag, notes: notes,
                        page: (j["html_url"] as? String).flatMap { URL(string: $0) }, zip: zip, sig: sig)
     }
 

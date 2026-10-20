@@ -7,6 +7,8 @@ VER=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" Info.plist)
 grep -q 'static let repo = "OWNER/' Sources/Volna/UpdateConfig.swift && { echo "[Ошибка] сначала: bash scripts/setup-release.sh owner/repo"; exit 1; }
 NOTES=$(awk -v v="$VER" '$0 ~ "^## \\[?"v"\\]?" {f=1; next} /^## / && f {exit} f' CHANGELOG.md | sed -e '/./,$!d')
 [ -n "$NOTES" ] || { echo "[Ошибка] в CHANGELOG.md нет раздела ## $VER"; exit 1; }
+REPO=$(grep -oE 'static let repo = "[^"]+"' Sources/Volna/UpdateConfig.swift | cut -d'"' -f2)
+NOTES="$NOTES"$'\n\n---\n'"**Установка и обновление одной командой:**"$'\n```bash\n'"curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | bash"$'\n```' 
 
 ARCHS=(--arch arm64 --arch x86_64)
 swift build -c release "${ARCHS[@]}" > .build.log 2>&1 || { show_errors; exit 1; }
