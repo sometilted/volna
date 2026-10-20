@@ -103,7 +103,7 @@ final class Prefs: ObservableObject {
 
     private init() {
         peek = d.object(forKey: "peek") as? Bool ?? true
-        style = d.string(forKey: "style") ?? UIStyle.classic.rawValue
+        style = UIStyle.from(d.string(forKey: "style")).rawValue   // старые стили 0.1.x → Прилив
         tgNotify = d.object(forKey: "tgNotify") as? Bool ?? true
         mood = d.string(forKey: "mood") ?? "all"
         diversity = d.string(forKey: "diversity") ?? "default"

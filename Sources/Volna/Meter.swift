@@ -1,52 +1,131 @@
 import AVFoundation
+import Accelerate
 import MediaToolbox
 import QuartzCore
 import os
 
-/// Уровни полос (низ → верх) из реального звука через MTAudioProcessingTap.
-/// Аудиопоток: однополюсные фильтры, без FFT и без аллокаций.
-/// UI: тап приходит ~10 раз в секунду, поэтому между пакетами значения плавно интерполируются в frame().
+/// Что видит интерфейс в текущем кадре.
+struct MeterFrame {
+    var bands: [Float]   // 0…1, низ → верх
+    var level: Float     // общая громкость относительно недавнего диапазона трека
+    var bass: Float      // низ (бочка, бас)
+    var kick: Float      // импульс удара: 1 в момент удара, затухает ~180 мс
+    var phase: Double    // фаза волны: бежит быстрее на громких местах и рывком на ударах
+
+    static let zero = MeterFrame(bands: [Float](repeating: 0, count: LevelMeter.bands),
+                                 level: 0, bass: 0, kick: 0, phase: 0)
+
+    /// Сжать полосы до n столбиков: среднее группы (максимум держал столбики почти всегда полными).
+    func bars(_ n: Int) -> [Float] {
+        let m = bands.count
+        return (0..<n).map { i in
+            let a = i * m / n, b = min(max((i + 1) * m / n, a + 1), m)
+            var s: Float = 0
+            for j in a..<b { s += bands[j] }
+            return s / Float(b - a)
+        }
+    }
+}
+
+/// Спектр из реального звука через MTAudioProcessingTap.
+/// Аудиопоток: FFT 2048 (Accelerate), 16 логарифмических полос 40 Гц…14 кГц, детектор ударов по низу.
+/// Каждая полоса нормируется к своему недавнему диапазону (пик опускается, «пол» поднимается),
+/// поэтому и пережатый поп, и тихий эмбиент используют всю высоту.
+/// Без аллокаций в аудиопотоке: все буферы выделены заранее.
 final class LevelMeter: @unchecked Sendable {
-    static let bands = 5
-    private static let cutoffs: [Double] = [150, 500, 1500, 4500]      // границы полос, Гц
-    private static let gains: [Float] = [1.0, 1.4, 2.0, 3.0, 4.5]       // верхние полосы тише — подтягиваем
+    static let bands = 16
+    private static let log2n: vDSP_Length = 11
+    private static let n = 2048
+    private static let fMin = 40.0, fMax = 14000.0
 
     private var lock = os_unfair_lock()
-    private var target = [Float](repeating: 0, count: LevelMeter.bands)   // под lock
+    // под lock
+    private var target = [Float](repeating: 0, count: LevelMeter.bands)
+    private var tLevel: Float = 0
+    private var tBass: Float = 0
+    private var beats = 0
+    private var beatPower: Float = 0
 
     // только аудиопоток
-    private var coef = [Float](repeating: 0, count: 4)
-    private var lp = [Float](repeating: 0, count: 4)
-    private var energy = [Float](repeating: 0, count: LevelMeter.bands)
-    private var avg = [Float](repeating: -30, count: LevelMeter.bands)   // скользящий пик dB по полосе
+    private let fft: FFTSetup
+    private let ring = UnsafeMutablePointer<Float>.allocate(capacity: LevelMeter.n)
+    private let win = UnsafeMutablePointer<Float>.allocate(capacity: LevelMeter.n)
+    private let buf = UnsafeMutablePointer<Float>.allocate(capacity: LevelMeter.n)
+    private let re = UnsafeMutablePointer<Float>.allocate(capacity: LevelMeter.n / 2)
+    private let im = UnsafeMutablePointer<Float>.allocate(capacity: LevelMeter.n / 2)
+    private let mags = UnsafeMutablePointer<Float>.allocate(capacity: LevelMeter.n / 2)
+    private let db = UnsafeMutablePointer<Float>.allocate(capacity: LevelMeter.bands)
+    private let prevDb = UnsafeMutablePointer<Float>.allocate(capacity: LevelMeter.bands)
+    private let hi = UnsafeMutablePointer<Float>.allocate(capacity: LevelMeter.bands)
+    private let lo = UnsafeMutablePointer<Float>.allocate(capacity: LevelMeter.bands)
+    private var binLo = [Int](repeating: 1, count: LevelMeter.bands)
+    private var binHi = [Int](repeating: 2, count: LevelMeter.bands)
+    private var ringPos = 0
+    private var levelHi: Float = -20, levelLo: Float = -50
+    private var fluxAvg: Float = 2
+    private var sinceBeat: Double = 1
     private var sampleRate: Double = 44100
     private var logFrames = 0
+    private var logBeats = 0
     private var isFloat = true
 
     // только главный поток
     private var display = [Float](repeating: 0, count: LevelMeter.bands)
+    private var dLevel: Float = 0, dBass: Float = 0, dKick: Float = 0
+    private var phase: Double = 0
+    private var seenBeats = 0
     private var lastFrame = CACurrentMediaTime()
+    private var cached = MeterFrame.zero
 
-    /// Значения для текущего кадра: быстрый подъём (~25 мс), плавный спад (~160 мс).
-    func frame() -> [Float] {
-        let now = CACurrentMediaTime()
-        let dt = min(now - lastFrame, 0.1)
-        lastFrame = now
-        os_unfair_lock_lock(&lock)
-        let t = target
-        os_unfair_lock_unlock(&lock)
-        let up = Float(1 - exp(-dt / 0.025))
-        let down = Float(1 - exp(-dt / 0.16))
-        for i in 0..<Self.bands {
-            let k = t[i] > display[i] ? up : down
-            display[i] += (t[i] - display[i]) * k
+    init() {
+        fft = vDSP_create_fftsetup(Self.log2n, FFTRadix(kFFTRadix2))!
+        vDSP_hann_window(win, vDSP_Length(Self.n), Int32(vDSP_HANN_NORM))
+        ring.initialize(repeating: 0, count: Self.n)
+        for k in 0..<Self.bands {
+            prevDb[k] = -80; hi[k] = -30; lo[k] = -60
         }
-        return display
+    }
+
+    /// Значения для текущего кадра: быстрый подъём (~20 мс), спад ~120 мс, удар гаснет ~180 мс.
+    /// Несколько вьюх за один кадр получают одно и то же.
+    func frame() -> MeterFrame {
+        let now = CACurrentMediaTime()
+        let raw = now - lastFrame
+        if raw < 0.004 { return cached }
+        lastFrame = now
+        let dt = min(raw, 0.1)
+        os_unfair_lock_lock(&lock)
+        let t = target, tl = tLevel, tb = tBass, b = beats, bp = beatPower
+        os_unfair_lock_unlock(&lock)
+        let up = Float(1 - exp(-dt / 0.02))
+        let down = Float(1 - exp(-dt / 0.085))
+        @inline(__always) func ease(_ cur: Float, _ to: Float) -> Float {
+            cur + (to - cur) * (to > cur ? up : down)
+        }
+        for i in 0..<Self.bands { display[i] = ease(display[i], t[i]) }
+        dLevel = ease(dLevel, tl)
+        dBass = ease(dBass, tb)
+        if b != seenBeats {
+            seenBeats = b
+            dKick = max(dKick, bp)
+        } else {
+            dKick *= Float(exp(-dt / 0.18))
+        }
+        phase += dt * (1.2 + 3.5 * Double(dLevel) + 9 * Double(dKick))
+        cached = MeterFrame(bands: display, level: dLevel, bass: dBass, kick: dKick, phase: phase)
+        return cached
+    }
+
+    /// Пауза: всё в ноль, фаза сохраняется — волна не прыгает при продолжении.
+    func idle() -> MeterFrame {
+        MeterFrame(bands: [Float](repeating: 0, count: Self.bands), level: 0, bass: 0, kick: 0, phase: phase)
     }
 
     func reset() {
         os_unfair_lock_lock(&lock)
         for i in 0..<Self.bands { target[i] = 0 }
+        tLevel = 0
+        tBass = 0
         os_unfair_lock_unlock(&lock)
     }
 
@@ -55,11 +134,30 @@ final class LevelMeter: @unchecked Sendable {
         let sr = max(sampleRate, 8000)
         self.sampleRate = sr
         logFrames = 0
-        ylog("meter: prepare sr=\(Int(sr)) float32=\(isFloat)")
-        for i in 0..<4 {
-            coef[i] = Float(1 - exp(-2 * Double.pi * Self.cutoffs[i] / sr))
-            lp[i] = 0
+        let binHz = sr / Double(Self.n)
+        let top = Self.n / 2
+        for k in 0..<Self.bands {
+            let f0 = Self.fMin * pow(Self.fMax / Self.fMin, Double(k) / Double(Self.bands))
+            let f1 = Self.fMin * pow(Self.fMax / Self.fMin, Double(k + 1) / Double(Self.bands))
+            var a = max(1, Int(f0 / binHz))
+            var b = max(a + 1, Int(f1 / binHz))
+            b = min(b, top)
+            a = min(a, b - 1)
+            binLo[k] = a
+            binHi[k] = b
         }
+        ylog("meter: prepare sr=\(Int(sr)) float32=\(isFloat) fft=\(Self.n) bands=\(Self.bands)")
+    }
+
+    /// Приводит dB к 0…1 по диапазону последних секунд: пик опускается 3 дБ/с, пол поднимается 3 дБ/с,
+    /// окно ≥ 18 дБ. Квадрат — середина уходит вниз, до верха достают только настоящие пики.
+    @inline(__always)
+    private static func norm(_ v: Float, _ hi: inout Float, _ lo: inout Float, _ dt: Float) -> Float {
+        hi = max(v, hi - 3 * dt)
+        lo = min(v, lo + 3 * dt)
+        if hi - lo < 18 { lo = hi - 18 }
+        let x = min(max((v - lo) / (hi - lo), 0), 1)
+        return x * x
     }
 
     fileprivate func process(_ abl: UnsafeMutablePointer<AudioBufferList>, frames: Int) {
@@ -68,10 +166,11 @@ final class LevelMeter: @unchecked Sendable {
         guard bufs.count > 0, let p0 = bufs[0].mData?.assumingMemoryBound(to: Float.self) else { return }
         let ch = max(Int(bufs[0].mNumberChannels), 1)
         let p1: UnsafeMutablePointer<Float>? = bufs.count > 1 ? bufs[1].mData?.assumingMemoryBound(to: Float.self) : nil
+        let n = Self.n, half = n / 2
 
-        var l0 = lp[0], l1 = lp[1], l2 = lp[2], l3 = lp[3]
-        let c0 = coef[0], c1 = coef[1], c2 = coef[2], c3 = coef[3]
-        var e0: Float = 0, e1: Float = 0, e2: Float = 0, e3: Float = 0, e4: Float = 0
+        // моно в кольцевой буфер + RMS нового куска
+        var sq: Float = 0
+        var pos = ringPos
         for i in 0..<frames {
             let x: Float
             if let p1 = p1 {
@@ -81,44 +180,79 @@ final class LevelMeter: @unchecked Sendable {
             } else {
                 x = p0[i]
             }
-            l0 += c0 * (x - l0)
-            l1 += c1 * (x - l1)
-            l2 += c2 * (x - l2)
-            l3 += c3 * (x - l3)
-            let b1 = l1 - l0, b2 = l2 - l1, b3 = l3 - l2, b4 = x - l3
-            e0 += l0 * l0; e1 += b1 * b1; e2 += b2 * b2; e3 += b3 * b3; e4 += b4 * b4
+            ring[pos] = x
+            pos += 1
+            if pos == n { pos = 0 }
+            sq += x * x
         }
-        lp[0] = l0; lp[1] = l1; lp[2] = l2; lp[3] = l3
-        energy[0] = e0; energy[1] = e1; energy[2] = e2; energy[3] = e3; energy[4] = e4
+        ringPos = pos
+        let dt = Float(Double(frames) / sampleRate)
+        sinceBeat += Double(dt)
+        let rmsDb = 10 * log10(max(sq / Float(frames), 1e-12))
 
-        // Абсолютный уровень у сжатой современной музыки почти всегда у потолка — столбики стояли бы ровно.
-        // Поэтому каждая полоса нормируется к своему недавнему пику (окно 12 дБ).
-        let n = Float(frames)
-        var dbs = [Float](repeating: 0, count: Self.bands)
+        if rmsDb < -70 {
+            os_unfair_lock_lock(&lock)
+            for k in 0..<Self.bands { target[k] = 0 }
+            tLevel = 0
+            tBass = 0
+            os_unfair_lock_unlock(&lock)
+            return
+        }
+
+        // окно последних n сэмплов по порядку, Ханн, FFT
+        let tail = n - pos
+        buf.update(from: ring + pos, count: tail)
+        if pos > 0 { (buf + tail).update(from: ring, count: pos) }
+        vDSP_vmul(buf, 1, win, 1, buf, 1, vDSP_Length(n))
+        var split = DSPSplitComplex(realp: re, imagp: im)
+        buf.withMemoryRebound(to: DSPComplex.self, capacity: half) {
+            vDSP_ctoz($0, 2, &split, 1, vDSP_Length(half))
+        }
+        vDSP_fft_zrip(fft, &split, 1, Self.log2n, FFTDirection(FFT_FORWARD))
+        vDSP_zvmags(&split, 1, mags, 1, vDSP_Length(half))
+
+        // полосы, поток ударов по низу (40…250 Гц)
+        var flux: Float = 0
+        for k in 0..<Self.bands {
+            var s: Float = 0
+            let a = binLo[k], b = binHi[k]
+            for j in a..<b { s += mags[j] }
+            let v = 10 * log10(max(s / Float(b - a), 1e-12))
+            db[k] = v
+            if k < 5 { flux += max(0, v - prevDb[k]) }
+            prevDb[k] = v
+        }
+        fluxAvg += (flux - fluxAvg) * 0.04
+        var beat: Float = 0
+        if flux > max(2.0 * fluxAvg, 2.5), sinceBeat > 0.16 {
+            sinceBeat = 0
+            beat = min(max(0.55 + 0.15 * (flux / max(fluxAvg, 0.5) - 2), 0.55), 1)
+        }
+
+        var vals = (Float(0), Float(0))   // (бас, общий) — без массивов
         os_unfair_lock_lock(&lock)
         for k in 0..<Self.bands {
-            let rms = (energy[k] / n).squareRoot() * Self.gains[k]
-            let db = 20 * log10(max(rms, 1e-6))
-            dbs[k] = db
-            if db < -70 {
-                target[k] = 0
-                continue
-            }
-            // АРУ по полосе: пик держится и медленно опускается (~4 дБ/с), уровень = насколько близко к пику.
-            // Громкие доли — у потолка, провалы между ними — вниз; тихий и громкий трек выглядят одинаково живо.
-            avg[k] = max(db, avg[k] - 4 * Float(Double(frames) / sampleRate))
-            target[k] = min(max(1 - (avg[k] - db) / 12, 0.04), 1)
+            let x = Self.norm(db[k], &hi[k], &lo[k], dt)
+            target[k] = max(x, 0.03)
+            if k < 5 { vals.0 += x / 5 }   // среднее низа: максимум почти всегда был у потолка
         }
-        let snapshot = target
+        vals.1 = Self.norm(rmsDb, &levelHi, &levelLo, dt)
+        tBass = vals.0
+        tLevel = vals.1
+        if beat > 0 {
+            beats &+= 1
+            beatPower = beat
+        }
         os_unfair_lock_unlock(&lock)
 
-        // диагностика раз в ~4 с: есть ли вообще звук в тапе и как он раскладывается по полосам
+        // диагностика раз в ~4 с
+        if beat > 0 { logBeats += 1 }
         logFrames += frames
         if logFrames > Int(sampleRate * 4) {
             logFrames = 0
-            let d = dbs.map { String(Int($0)) }.joined(separator: " ")
-            let t = snapshot.map { String(format: "%.2f", $0) }.joined(separator: " ")
-            ylog("meter: frames=\(frames) dB[\(d)] t[\(t)]")
+            ylog(String(format: "meter: rms=%.0f dB bass=%.2f level=%.2f beats/4s=%ld flux~%.1f",
+                        rmsDb, vals.0, vals.1, logBeats, fluxAvg))
+            logBeats = 0
         }
     }
 

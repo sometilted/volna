@@ -1,18 +1,111 @@
 import AppKit
 import SwiftUI
 
-/// Варианты оформления раскрытой панели. Переключаются в меню «Стиль», прежние не затираются.
+/// Четыре стиля. У каждого свой акцент и свой визуализатор.
+/// Старые значения (classic / impeccable / emil из 0.1.x) читаются как «Прилив».
 enum UIStyle: String, CaseIterable {
-    case classic, impeccable, taste, emil, candy, designer
+    case candy, taste, designer, glass
 
     var title: String {
         switch self {
-        case .classic: "Штиль"
-        case .impeccable: "Глубина"
-        case .taste: "Закат"
-        case .emil: "Течение"
         case .candy: "Прилив"
+        case .taste: "Закат"
         case .designer: "@opiatolove"
+        case .glass: "Стекло"
+        }
+    }
+
+    var accent: Color {
+        switch self {
+        case .candy: Color(red: 1.0, green: 0.82, blue: 0.24)       // жёлтый «Моей волны»
+        case .taste: Color(red: 1.0, green: 0.45, blue: 0.33)       // коралл
+        case .designer: Color(red: 0.91, green: 0.80, blue: 0.68)   // песок под фон #282320
+        case .glass: Color(red: 0.56, green: 0.83, blue: 1.0)       // лёд
+        }
+    }
+
+    static func from(_ raw: String?) -> UIStyle { raw.flatMap(UIStyle.init(rawValue:)) ?? .candy }
+    /// без MainActor: читается прямо из UserDefaults, куда пишет Prefs
+    static var current: UIStyle { from(UserDefaults.standard.string(forKey: "style")) }
+}
+
+/// Акцент текущего стиля.
+var accent: Color { UIStyle.current.accent }
+
+// MARK: - визуализаторы: у каждого стиля свой
+
+/// Прилив — столбики спектра; Закат — волна; @opiatolove — зеркальные штрихи; Стекло — жидкие столбики.
+struct Visualizer: View {
+    let style: UIStyle
+    let playing: Bool
+    let meter: LevelMeter
+    var tint: Color? = nil
+
+    var body: some View {
+        switch style {
+        case .candy:
+            Bars(playing: playing, meter: meter, color: style.accent)
+        case .taste:
+            MiniWave(playing: playing, meter: meter, color: tint ?? style.accent)
+        case .designer:
+            PulseLines(playing: playing, meter: meter, color: style.accent)
+        case .glass:
+            LiquidBars(playing: playing, meter: meter, color: style.accent)
+        }
+    }
+}
+
+/// Зеркальные тонкие штрихи от центральной линии, как в диктофоне: 7 штук, середина — бас.
+struct PulseLines: View {
+    let playing: Bool
+    let meter: LevelMeter
+    let color: Color
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !playing)) { _ in
+            let m = playing ? meter.frame() : meter.idle()
+            let b = m.bars(4)   // 0 — низ … 3 — верх; раскладываем от центра к краям
+            let order = [3, 2, 1, 0, 1, 2, 3]
+            GeometryReader { g in
+                HStack(alignment: .center, spacing: 1.8) {
+                    ForEach(0..<7, id: \.self) { i in
+                        let v = min(CGFloat(b[order[i]]) + CGFloat(m.kick) * (i == 3 ? 0.35 : 0.15), 1)
+                        Capsule()
+                            .fill(color.opacity(0.45 + 0.55 * Double(v)))
+                            .frame(width: 1.5, height: 2 + (g.size.height - 2) * v)
+                    }
+                }
+                .frame(width: g.size.width, height: g.size.height)
+            }
+        }
+    }
+}
+
+/// Жидкие столбики: соседние сливаются в одну каплю (blur + порог альфы), как ртуть.
+struct LiquidBars: View {
+    let playing: Bool
+    let meter: LevelMeter
+    let color: Color
+    var count = 5
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !playing)) { _ in
+            let m = playing ? meter.frame() : meter.idle()
+            let l = m.bars(count)
+            Canvas { ctx, size in
+                ctx.addFilter(.alphaThreshold(min: 0.5, color: color))
+                ctx.addFilter(.blur(radius: 1.6))
+                ctx.drawLayer { c in
+                    let step = size.width / CGFloat(count)
+                    for i in 0..<count {
+                        let v = CGFloat(l[i])
+                        let h = 4 + (size.height - 4) * v
+                        let r = CGRect(x: CGFloat(i) * step + step * 0.12, y: (size.height - h) / 2,
+                                       width: step * 0.76, height: h)
+                        c.fill(Path(roundedRect: r, cornerRadius: step * 0.38), with: .color(.white))
+                    }
+                }
+            }
         }
     }
 }
@@ -188,28 +281,44 @@ struct HoverProgress: View {
 
 struct WaveShape: Shape {
     var phase: Double
+    /// доля доступной полувысоты, 0…1
     var amp: CGFloat
     var freq: Double
+    /// огибающая по ширине (полосы спектра): каждый участок волны дышит своей частотой
+    var env: [Float] = []
+    /// минимум огибающей, чтобы тихие участки не превращались в прямую
+    var floor: CGFloat = 0.2
+    /// концы прижаты к центру (для маленькой волны в нотче)
+    var taper = false
+    var lineWidth: CGFloat = 2
 
     func path(in r: CGRect) -> Path {
         var p = Path()
         let w = max(r.width, 1)
-        let steps = max(Int(w / 2), 2)
+        let maxA = max(r.height / 2 - lineWidth / 2, 0.5)
+        let steps = max(Int(w / 1.5), 2)
+        let m = env.count
         for i in 0...steps {
-            let x = CGFloat(i) / CGFloat(steps) * w
-            let y = r.midY + CGFloat(sin(Double(x / w) * freq * 2 * Double.pi + phase)) * amp
-            if i == 0 { p.move(to: CGPoint(x: r.minX + x, y: y)) } else { p.addLine(to: CGPoint(x: r.minX + x, y: y)) }
+            let u = CGFloat(i) / CGFloat(steps)
+            var a = maxA * min(amp, 1)
+            if m > 1 {
+                let fx = u * CGFloat(m - 1)
+                let k = min(Int(fx), m - 2)
+                let e = CGFloat(env[k]) + (CGFloat(env[k + 1]) - CGFloat(env[k])) * (fx - CGFloat(k))
+                a *= floor + (1 - floor) * e
+            }
+            if taper { a *= sin(u * .pi) }
+            let x = Double(u) * freq * 2 * Double.pi
+            // вторая гармоника против хода — линия живая, а не школьная синусоида
+            let s = (sin(x + phase) + 0.35 * sin(2.3 * x - phase * 1.7)) / 1.35
+            let pt = CGPoint(x: r.minX + u * w, y: r.midY + CGFloat(s) * a)
+            if i == 0 { p.move(to: pt) } else { p.addLine(to: pt) }
         }
         return p
     }
 }
 
-/// Для волны берём самую активную полосу: среднее по полосам гасит удары друг о друга.
-private func energy(_ l: [Float]) -> CGFloat {
-    CGFloat(l.max() ?? 0)
-}
-
-/// Прогресс-волна: амплитуда — реальная громкость, сыгранная часть белая.
+/// Прогресс-волна: огибающая — спектр, размах — громкость и удары, сыгранная часть белая.
 struct WaveProgress: View {
     let position: Double
     let duration: Double
@@ -218,16 +327,17 @@ struct WaveProgress: View {
     let onSeek: (Double) -> Void
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !playing)) { ctx in
-            let e = playing ? energy(meter.frame()) : 0
-            let t = ctx.date.timeIntervalSinceReferenceDate
+        TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !playing)) { _ in
+            let m = playing ? meter.frame() : meter.idle()
             GeometryReader { g in
                 let f = duration > 0 ? CGFloat(min(position / duration, 1)) : 0
-                let wave = WaveShape(phase: t * 3, amp: 1.2 + 6 * e, freq: 4)
+                let wave = WaveShape(phase: m.phase * 2, amp: 0.15 + 0.5 * CGFloat(m.level) + 0.35 * CGFloat(m.kick),
+                                     freq: 4, env: m.bands, floor: 0.25)
                 let style = StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round)
                 ZStack(alignment: .leading) {
                     wave.stroke(Color.white.opacity(0.22), style: style)
-                    wave.stroke(Color.white, style: style)
+                    wave.stroke(accent, style: style)
+                        .shadow(color: accent.opacity(0.7 * Double(m.kick)), radius: 4)
                         .mask(alignment: .leading) {
                             Rectangle().frame(width: g.size.width * f)
                         }
@@ -243,17 +353,40 @@ struct WaveProgress: View {
     }
 }
 
-/// Маленькая волна для свёрнутого нотча.
+/// Маленькая волна для свёрнутого нотча: спектр по ширине, удар — всплеск и свечение.
 struct MiniWave: View {
     let playing: Bool
     let meter: LevelMeter
     let color: Color
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !playing)) { ctx in
-            let e = playing ? energy(meter.frame()) : 0
-            WaveShape(phase: ctx.date.timeIntervalSinceReferenceDate * 6, amp: 1 + 6 * e, freq: 1.5)
+        TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !playing)) { _ in
+            let m = playing ? meter.frame() : meter.idle()
+            WaveShape(phase: m.phase * 3, amp: 0.25 + 0.45 * CGFloat(m.level) + 0.3 * CGFloat(m.kick),
+                      freq: 1.5, env: m.bands, floor: 0.3, taper: true)
                 .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                .shadow(color: color.opacity(0.8 * Double(m.kick)), radius: 3)
+        }
+    }
+}
+
+/// Фон «Заката»: цвет обложки снизу дышит басом и вспыхивает на ударах.
+struct SunsetGlow: View {
+    let playing: Bool
+    let meter: LevelMeter
+    let tint: Color
+    /// до какой доли высоты фон чисто чёрный — чтобы вырез не выделялся на цветном
+    var blackTo: CGFloat = 0.2
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !playing)) { _ in
+            let m = playing ? meter.frame() : meter.idle()
+            let c = tint.opacity(0.35 + 0.2 * Double(m.bass) + 0.2 * Double(m.kick))
+            LinearGradient(stops: [
+                .init(color: .black, location: 0),
+                .init(color: .black, location: min(blackTo, 0.9)),
+                .init(color: c, location: 1),
+            ], startPoint: .top, endPoint: .bottom)
         }
     }
 }
@@ -404,6 +537,8 @@ struct EmilButton: View {
     var dim = false
     var pressScale: CGFloat = 0.85
     var heart = false
+    /// залитый круг (play в цвете акцента)
+    var fill: Color? = nil
     let action: () -> Void
     @ObservedObject private var hm = HoverModel.shared
 
@@ -417,7 +552,7 @@ struct EmilButton: View {
                 .modifier(SymbolSwap())
                 .modifier(HeartPop(value: heart))
                 .frame(width: box, height: box)
-                .background(Circle().fill(Color.white.opacity(hover ? 0.1 : 0)))
+                .background(Circle().fill(fill ?? Color.white.opacity(hover ? 0.1 : 0)))
                 .scaleEffect(hover && !reduceMotion ? 1.08 : 1)
                 .contentShape(Circle())
         }
@@ -464,10 +599,11 @@ struct WaveFill: View {
     let meter: LevelMeter
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !playing)) { ctx in
-            let e = playing ? energy(meter.frame()) : 0
+        TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !playing)) { _ in
+            let m = playing ? meter.frame() : meter.idle()
             GeometryReader { g in
-                let wave = WaveShape(phase: ctx.date.timeIntervalSinceReferenceDate * 3, amp: 1 + 4 * e, freq: 5)
+                let wave = WaveShape(phase: m.phase * 2, amp: 0.15 + 0.5 * CGFloat(m.level) + 0.35 * CGFloat(m.kick),
+                                     freq: 5, env: m.bands, floor: 0.25)
                 let st = StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round)
                 ZStack(alignment: .leading) {
                     wave.stroke(Color.white.opacity(0.2), style: st)
@@ -510,7 +646,7 @@ struct ScrubBar: View {
                     } else {
                         Capsule().fill(Color.white.opacity(0.16))
                             .frame(height: active ? 5 : 3)
-                        Capsule().fill(Color.white.opacity(0.9))
+                        Capsule().fill(accent)
                             .frame(width: w * frac, height: active ? 5 : 3)
                     }
                     Circle()
@@ -613,6 +749,7 @@ struct EmilExpanded: View {
 
 struct CandyExpanded: View {
     @ObservedObject var player: Player
+    var style: UIStyle = .candy
 
     var body: some View {
         let slide = AnyTransition.trackSlide(player.direction)
@@ -641,9 +778,15 @@ struct CandyExpanded: View {
                         .transition(slide)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.trailing, 32)
                     .clipped()
                     ScrubBar(position: player.position, duration: player.duration) { player.seek(fraction: $0) }
                         .padding(.top, 4)
+                }
+                .overlay(alignment: .topTrailing) {
+                    Visualizer(style: style, playing: player.isPlaying, meter: player.meter)
+                        .frame(width: 23, height: 16)
+                        .padding(.top, 2)
                 }
                 .modifier(StaggerIn(delay: 0.06))
             }
@@ -653,7 +796,7 @@ struct CandyExpanded: View {
                 EmilButton(icon: "backward.fill", label: "Предыдущий", size: 15) { player.prev() }
                 EmilButton(icon: player.isPlaying ? "pause.fill" : "play.fill",
                            label: player.isPlaying ? "Пауза" : "Играть",
-                           size: 20, box: 36, pressScale: 0.8) { player.toggle() }
+                           size: 17, box: 36, tint: .black, pressScale: 0.8, fill: style.accent) { player.toggle() }
                 EmilButton(icon: "forward.fill", label: "Следующий", size: 15) { player.next() }
                 Spacer()
                 EmilButton(icon: player.liked ? "heart.fill" : "heart",
@@ -694,7 +837,7 @@ struct DesignerProgress: View {
             ZStack(alignment: .leading) {
                 Capsule().fill(Color.white.opacity(0.3))
                     .frame(height: active ? 3 : 1)
-                Capsule().fill(Color.white)
+                Capsule().fill(accent)
                     .frame(width: w * frac, height: active ? 3 : 1)
                 Circle()
                     .fill(Color.white)
@@ -737,7 +880,7 @@ struct DesignerPlay: View {
                 .foregroundColor(Color(red: 40 / 255, green: 35 / 255, blue: 32 / 255))
                 .modifier(SymbolSwap())
                 .frame(width: 35, height: 35)
-                .background(Circle().fill(designerGray))
+                .background(Circle().fill(accent))
                 .scaleEffect(hover && !reduceMotion ? 1.06 : 1)
                 .contentShape(Circle())
         }
@@ -780,9 +923,15 @@ struct DesignerExpanded: View {
                 .id(player.current?.id)
                 .transition(slide)
             }
-            .frame(width: 232.5, alignment: .leading)
+            .frame(width: 200, alignment: .leading)
             .clipped()
             .offset(x: 127.5, y: 30.5)
+
+            // визуализатор в правом верхнем углу текстового блока
+            Visualizer(style: .designer, playing: player.isPlaying, meter: player.meter)
+                .frame(width: 22, height: 16)
+                .offset(x: 127.5 + 232.5 - 22, y: 33)
+                .modifier(StaggerIn(delay: 0.05))
             .modifier(StaggerIn(delay: 0.05))
 
             // линия прогресса: y = 90, ширина 232.5
@@ -813,5 +962,183 @@ struct DesignerExpanded: View {
         .foregroundColor(.white)
         .animation(reduceMotion ? .easeOut(duration: 0.15) : .spring(response: 0.35, dampingFraction: 1),
                    value: player.current?.id)
+    }
+}
+
+
+// MARK: - Стекло: как Now Playing в iOS/macOS 26 — нотч остаётся чёрной «таблеткой»,
+// а из-под него выпадает отдельная стеклянная карточка (Liquid Glass) со стеклянными кнопками.
+// На системах до macOS 26 — матовое размытие того, что под окном.
+
+/// Матовое размытие того, что под окном (запасной вариант без Liquid Glass).
+struct BehindBlur: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let v = NSVisualEffectView()
+        v.material = .hudWindow
+        v.blendingMode = .behindWindow
+        v.state = .active
+        v.appearance = NSAppearance(named: .darkAqua)
+        return v
+    }
+    func updateNSView(_ v: NSVisualEffectView, context: Context) {}
+}
+
+struct GlassSurface<S: Shape>: ViewModifier {
+    let shape: S
+    func body(content: Content) -> some View {
+        if #available(macOS 26, *) {
+            content.glassEffect(.regular, in: shape)
+        } else {
+            content
+                .background(BehindBlur().clipShape(shape))
+                .overlay(shape.stroke(Color.white.opacity(0.18), lineWidth: 0.5))
+        }
+    }
+}
+
+struct GlassButton: View {
+    let icon: String
+    let label: String
+    var size: CGFloat = 14
+    var box: CGFloat = 36
+    var tint: Color? = nil
+    var iconColor: Color = .white
+    let action: () -> Void
+
+    var body: some View {
+        let b = Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: size, weight: .semibold))
+                .foregroundColor(iconColor)
+                .modifier(SymbolSwap())
+                .frame(width: box, height: box)
+                .contentShape(Circle())
+        }
+        .buttonStyle(PressStyle(scale: 0.88))
+        .accessibilityLabel(label)
+        .help(label)
+        if #available(macOS 26, *) {
+            b.glassEffect(tint.map { Glass.regular.tint($0).interactive() } ?? Glass.regular.interactive(), in: Circle())
+        } else {
+            b.background(Circle().fill(tint ?? Color.white.opacity(0.12)))
+        }
+    }
+}
+
+/// Стеклянная подложка. Свёрнуто — два стёклышка у боков выреза; раскрыто — они растягиваются
+/// навстречу друг другу и перекрываются в центре, а GlassEffectContainer сливает их в одно стекло.
+struct GlassShell: View {
+    let expanded: Bool
+    let visible: Bool
+    let W: CGFloat, H: CGFloat
+    let sw: CGFloat, ch: CGFloat, sideX: CGFloat
+
+    var body: some View {
+        let half = W / 2
+        let lw = expanded ? half + 30 : sw
+        let lh = expanded ? H : ch
+        let lx = expanded ? -(half - lw / 2) : -sideX
+        let y: CGFloat = expanded ? 0 : 3
+        let r: CGFloat = expanded ? 26 : ch / 2
+        Group {
+            if #available(macOS 26, *) {
+                GlassEffectContainer(spacing: 18) {
+                    ZStack(alignment: .top) {
+                        piece(r).frame(width: lw, height: lh).offset(x: lx, y: y)
+                        piece(r).frame(width: lw, height: lh).offset(x: -lx, y: y)
+                    }
+                }
+            } else if expanded {
+                piece(r).frame(width: W, height: H)
+            } else {
+                ZStack(alignment: .top) {
+                    piece(r).frame(width: lw, height: lh).offset(x: lx, y: y)
+                    piece(r).frame(width: lw, height: lh).offset(x: -lx, y: y)
+                }
+            }
+        }
+        .opacity(visible ? 1 : 0)
+    }
+
+    /// Под стеклом почти невидимая заливка: полностью прозрачные пиксели окна macOS пропускает насквозь,
+    /// и правый клик по стеклу уходил «в никуда» — меню не открывалось.
+    private func piece(_ r: CGFloat) -> some View {
+        let shape = RoundedRectangle(cornerRadius: r, style: .continuous)
+        return Color.black.opacity(0.02)
+            .clipShape(shape)
+            .contentShape(shape)
+            .modifier(GlassSurface(shape: shape))
+    }
+}
+
+/// Содержимое цельного стекла: трек, большой жидкий визуализатор, прогресс, стеклянные кнопки.
+struct GlassExpanded: View {
+    @ObservedObject var player: Player
+    let top: CGFloat
+
+    var body: some View {
+        let slide = AnyTransition.trackSlide(player.direction)
+        let a = UIStyle.glass.accent
+        VStack(spacing: 10) {
+            Color.clear.frame(height: top)
+            HStack(spacing: 12) {
+                ZStack {
+                    CoverView(image: player.cover, size: 56, radius: 12)
+                        .id(player.current?.id)
+                        .transition(slide)
+                }
+                .frame(width: 56, height: 56)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                ZStack(alignment: .leading) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(player.current?.title ?? "—")
+                            .font(.system(size: 14, weight: .semibold))
+                            .lineLimit(1)
+                        Text(player.status ?? player.current?.artists ?? "")
+                            .font(.system(size: 12))
+                            .foregroundColor(player.status == nil ? Color.white.opacity(0.65) : a)
+                            .lineLimit(1)
+                    }
+                    .id(player.current?.id)
+                    .transition(slide)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .clipped()
+                LiquidBars(playing: player.isPlaying, meter: player.meter, color: a, count: 9)
+                    .frame(width: 72, height: 34)
+            }
+            ScrubBar(position: player.position, duration: player.duration) { player.seek(fraction: $0) }
+            controls
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 20)
+        .padding(.bottom, 16)
+        .animation(reduceMotion ? .easeOut(duration: 0.15) : .spring(response: 0.35, dampingFraction: 1),
+                   value: player.current?.id)
+    }
+
+    @ViewBuilder private var controls: some View {
+        if #available(macOS 26, *) {
+            GlassEffectContainer(spacing: 10) { row }
+        } else {
+            row
+        }
+    }
+
+    private var row: some View {
+        let a = UIStyle.glass.accent
+        return HStack(spacing: 10) {
+            GlassButton(icon: "hand.thumbsdown", label: "Не нравится", size: 12, box: 32) { player.dislike() }
+            Spacer(minLength: 0)
+            GlassButton(icon: "backward.fill", label: "Предыдущий", size: 14) { player.prev() }
+            GlassButton(icon: player.isPlaying ? "pause.fill" : "play.fill",
+                        label: player.isPlaying ? "Пауза" : "Играть",
+                        size: 17, box: 42, tint: a.opacity(0.85), iconColor: .black) { player.toggle() }
+            GlassButton(icon: "forward.fill", label: "Следующий", size: 14) { player.next() }
+            Spacer(minLength: 0)
+            GlassButton(icon: player.liked ? "heart.fill" : "heart",
+                        label: player.liked ? "Убрать из любимых" : "Нравится", size: 12, box: 32,
+                        iconColor: player.liked ? a : .white) { player.toggleLike() }
+        }
     }
 }

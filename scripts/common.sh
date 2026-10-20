@@ -28,3 +28,12 @@ assemble_app() {
   codesign --force -s "$id" "$app" >/dev/null 2>&1
   echo "[Подпись] $([ "$id" = "-" ] && echo "ad-hoc — доступы сбросятся после пересборки" || echo "$id")"
 }
+
+# Текст релиза: раздел версии из CHANGELOG.md + блок установки одной командой.
+# Окно обновления в приложении обрезает всё после «---».
+release_notes() {
+  local ver="$1" repo="$2" body
+  body=$(awk -v v="$ver" '$0 ~ "^## \\[?"v"\\]?" {f=1; next} /^## / && f {exit} f' CHANGELOG.md | sed -e '/./,$!d')
+  [ -n "$body" ] || return 1
+  printf '%s\n\n---\n**Установка и обновление одной командой:**\n```bash\ncurl -fsSL https://raw.githubusercontent.com/%s/main/install.sh | bash\n```\n' "$body" "$repo"
+}

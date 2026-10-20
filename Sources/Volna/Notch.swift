@@ -28,9 +28,19 @@ final class NotchModel: ObservableObject {
     @Published var notchW: CGFloat = 0
     @Published var notchH: CGFloat = 32
     let expandedW: CGFloat = 400
-    /// стиль «Дизайн» выше обычного: макет 400×177 pt (800×354 @2x)
-    @Published var tall = false
-    var expandedH: CGFloat { tall ? max(177, notchH + 112) : notchH + 112 }
+    /// от стиля зависит высота: @opiatolove — макет 400×177 pt, Стекло — карточка под нотчем
+    @Published var kind = UIStyle.candy
+    /// смена стиля: панель целиком прячется в вырез, потом раскрывается уже новым стилем
+    @Published var switching = false
+    var expandedH: CGFloat {
+        switch kind {
+        case .designer: return max(177, notchH + 112) + designerShift
+        case .glass: return notchH + 184
+        default: return notchH + 136
+        }
+    }
+    /// макет дизайнера рассчитан на низкий вырез: если текст залезает под вырез — сдвигаем всё вниз
+    var designerShift: CGFloat { max(0, notchH + 10 - 30.5) }
 
     func collapsedW(hasTrack: Bool) -> CGFloat {
         guard hasTrack else { return notchW }
@@ -38,23 +48,24 @@ final class NotchModel: ObservableObject {
     }
 }
 
+/// Клавиатуру панель берёт только после клика по раскрытому нотчу (для хоткеев) и отдаёт,
+/// как только нотч свернулся или нажата любая не наша клавиша — та пересылается обратно в систему.
 final class NotchPanel: NSPanel {
-    override var canBecomeKey: Bool { true }
+    var allowKey = false
+    override var canBecomeKey: Bool { allowKey }
     override var canBecomeMain: Bool { false }
 }
 
 @MainActor
 protocol MenuSource: AnyObject {
-    func buildMenu() -> NSMenu
+    func popMenu(with event: NSEvent, for view: NSView) -> Bool
 }
 
 final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
     weak var menuSource: MenuSource?
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func rightMouseDown(with event: NSEvent) {
-        if let m = menuSource?.buildMenu() {
-            NSMenu.popUpContextMenu(m, with: event, for: self)
-        } else {
+        if menuSource?.popMenu(with: event, for: self) != true {
             super.rightMouseDown(with: event)
         }
     }
@@ -64,7 +75,11 @@ final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
 final class MenuAction: NSObject {
     let fn: () -> Void
     init(_ fn: @escaping () -> Void) { self.fn = fn }
-    @objc func fire() { fn() }
+    /// Выполняется после закрытия меню: иначе перестройка панели под ним может съесть выбор.
+    @objc func fire() {
+        let fn = self.fn
+        DispatchQueue.main.async { fn() }
+    }
 }
 
 extension NSMenu {
@@ -100,7 +115,9 @@ final class NotchController: MenuSource {
     private let tg = TelegramWatcher()
     private let actions: NotchActions
     private let panelW: CGFloat = 440
-    private let panelH: CGFloat = 200
+    private let panelH: CGFloat = 240
+    /// пока открыто контекстное меню, наведение не сворачивает панель (курсор уходит в меню)
+    private var menuOpen = false
 
     init(player: Player, login: DeviceLogin, actions: NotchActions) {
         self.player = player
@@ -133,6 +150,18 @@ final class NotchController: MenuSource {
             MainActor.assumeIsolated { self?.track() }
             return e
         }) { monitors.append(m) }
+        // клик по раскрытому нотчу — берём клавиатуру для хоткеев
+        if let m = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: { [weak self] e in
+            MainActor.assumeIsolated {
+                guard let self = self, e.window === self.panel, self.model.expanded else { return }
+                self.panel.allowKey = true
+                self.panel.makeKey()
+            }
+            return e
+        }) { monitors.append(m) }
+        if let m = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { [weak self] e in
+            MainActor.assumeIsolated { (self?.handleKey(e) ?? false) ? nil : e }
+        }) { monitors.append(m) }
         panel.acceptsMouseMovedEvents = true
 
         _ = NotificationCenter.default.addObserver(
@@ -160,10 +189,10 @@ final class NotchController: MenuSource {
         if Prefs.shared.tgNotify { tg.start() }
 
         Prefs.shared.$style
-            .map { $0 == UIStyle.designer.rawValue }
+            .map { UIStyle.from($0) }
             .removeDuplicates()
-            .sink { [weak self] t in
-                MainActor.assumeIsolated { self?.model.tall = t }
+            .sink { [weak self] k in
+                MainActor.assumeIsolated { self?.model.kind = k }
             }
             .store(in: &bag)
 
@@ -186,6 +215,14 @@ final class NotchController: MenuSource {
         } else {
             track()
         }
+    }
+
+    func popMenu(with event: NSEvent, for view: NSView) -> Bool {
+        menuOpen = true
+        NSMenu.popUpContextMenu(buildMenu(), with: event, for: view)   // блокирует до закрытия
+        menuOpen = false
+        DispatchQueue.main.async { [weak self] in MainActor.assumeIsolated { self?.track() } }
+        return true
     }
 
     func buildMenu() -> NSMenu {
@@ -217,11 +254,16 @@ final class NotchController: MenuSource {
             wave("Язык", [("Любой", "any"), ("Русский", "russian"), ("Иностранный", "not-russian")], \.language)
             m.addItem(.separator())
         }
-        m.submenu("Стиль") { sub in
-            for st in UIStyle.allCases {
-                sub.add(st.title, checked: p.style == st.rawValue) { p.style = st.rawValue }
-            }
+        // стили — сразу в меню, без подменю: один клик
+        let head = NSMenuItem(title: "Стиль", action: nil, keyEquivalent: "")
+        head.isEnabled = false
+        m.addItem(head)
+        for (i, st) in UIStyle.allCases.enumerated() {
+            let it = m.add("   " + st.title, checked: p.style == st.rawValue) { [weak self] in self?.switchStyle(st) }
+            it.keyEquivalent = "\(i + 1)"
+            it.keyEquivalentModifierMask = .command
         }
+        m.addItem(.separator())
         m.add("Показывать смену трека", checked: p.peek) { p.peek.toggle() }
         let tg = self.tg
         m.add("Сообщения Telegram в нотче", checked: p.tgNotify) {
@@ -271,7 +313,7 @@ final class NotchController: MenuSource {
 
     private func track() {
         let p = NSEvent.mouseLocation
-        if model.pinned { return }
+        if model.pinned || menuOpen || model.switching { return }
         if model.peeking {
             // мышь зашла в выехавшую панель — превращаем пик в обычное раскрытие
             if expandedRect.contains(p) {
@@ -292,9 +334,44 @@ final class NotchController: MenuSource {
         }
     }
 
+    /// ⌘1…⌘4 — стиль, пробел — пауза, ←/→ — трек, Esc — свернуть.
+    /// Любая другая клавиша: отдаём фокус и пересылаем её системе — она попадёт туда, где печатали.
+    private func handleKey(_ e: NSEvent) -> Bool {
+        guard e.window === panel else { return false }
+        let mods = e.modifierFlags.intersection([.command, .option, .control, .shift])
+        if mods == .command, let c = e.charactersIgnoringModifiers, let n = Int(c),
+           n >= 1, n <= UIStyle.allCases.count {
+            switchStyle(UIStyle.allCases[n - 1])
+            return true
+        }
+        if mods.isEmpty {
+            switch e.keyCode {
+            case 49: player.toggle(); return true
+            case 123: player.prev(); return true
+            case 124: player.next(); return true
+            case 53: setExpanded(false); return true
+            default: break
+            }
+        }
+        let cg = e.cgEvent
+        releaseKey()
+        DispatchQueue.main.async { cg?.post(tap: .cghidEventTap) }
+        return true
+    }
+
+    /// Вернуть клавиатуру приложению, в котором работали.
+    private func releaseKey() {
+        panel.allowKey = false
+        if panel.isKeyWindow {
+            panel.orderOut(nil)
+            panel.orderFrontRegardless()
+        }
+    }
+
     private func setExpanded(_ v: Bool) {
         peekWork?.cancel()
         model.peeking = false
+        if !v { releaseKey() }
         guard model.expanded != v else { return }
         if v { revealSoon() } else { Reveal.shared.on = false; HoverModel.shared.key = nil }
         model.expanded = v
@@ -324,8 +401,30 @@ final class NotchController: MenuSource {
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: w)
     }
 
-    private func peek() {
-        guard Prefs.shared.peek else { return }
+    /// Прячет панель в вырез (~0.4 с), меняет стиль и раскрывает уже новым на 3 с (как смена трека).
+    private func switchStyle(_ st: UIStyle) {
+        guard Prefs.shared.style != st.rawValue else { return }
+        peekWork?.cancel()
+        model.peeking = false
+        model.switching = true
+        model.expanded = false
+        panel.ignoresMouseEvents = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.42) { [weak self] in
+            MainActor.assumeIsolated {
+                Prefs.shared.style = st.rawValue
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+                    MainActor.assumeIsolated {
+                        guard let self = self else { return }
+                        self.model.switching = false
+                        self.peek(force: true, seconds: 3)
+                    }
+                }
+            }
+        }
+    }
+
+    private func peek(force: Bool = false, seconds: Double = 2.5) {
+        guard force || Prefs.shared.peek else { return }
         guard !model.expanded || model.peeking else { return }
         model.peeking = true
         revealSoon()
@@ -336,10 +435,11 @@ final class NotchController: MenuSource {
                 guard let self = self, self.model.peeking else { return }
                 self.model.peeking = false
                 self.model.expanded = false
+                self.releaseKey()
             }
         }
         peekWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: w)
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: w)
     }
 }
 
@@ -380,7 +480,6 @@ struct NotchShape: Shape {
     }
 }
 
-let accent = Color(red: 1.0, green: 0.53, blue: 0.0)
 
 struct NotchView: View {
     @ObservedObject var player: Player
@@ -391,42 +490,116 @@ struct NotchView: View {
     @ObservedObject private var updater = Updater.shared
 
     private var showPill: Bool { player.current != nil || !player.loggedIn || model.notice != nil }
+    private var style: UIStyle { UIStyle.from(prefs.style) }
+    /// Стекло: свёрнуто — два стёклышка слева и справа от выреза, раскрыто — одно цельное стекло
+    private var glassMode: Bool { style == .glass && player.loggedIn }
+    /// уведомление Telegram в свёрнутом виде показываем обычной чёрной таблеткой
+    private var useGlass: Bool { glassMode && !model.switching && (model.expanded || model.notice == nil) }
+    private var grown: Bool { model.expanded && !model.switching }
+    /// свернуться в голый вырез при смене стиля
+    private var bare: Bool { model.switching }
     private var width: CGFloat {
-        model.expanded ? model.expandedW : model.collapsedW(hasTrack: showPill)
+        if bare { return model.notchW }
+        return grown ? model.expandedW : model.collapsedW(hasTrack: showPill)
     }
-    private var height: CGFloat { model.expanded ? model.expandedH : model.notchH }
-    private var style: UIStyle { UIStyle(rawValue: prefs.style) ?? .classic }
-    /// фон стиля «Дизайн»: чёрный → #0B0A0A (55%) → #282320, прозрачность 82%
+    private var height: CGFloat { grown ? model.expandedH : model.notchH }
+    /// фон стиля «@opiatolove»: чёрный → #0B0A0A (55%) → #282320, непрозрачный
     private var designerBackground: some ShapeStyle {
         LinearGradient(stops: [
             .init(color: .black, location: 0),
             .init(color: Color(red: 11 / 255, green: 10 / 255, blue: 10 / 255), location: 0.553),
             .init(color: Color(red: 40 / 255, green: 35 / 255, blue: 32 / 255), location: 1),
         ], startPoint: .top, endPoint: .bottom)
-        .opacity(0.82)
     }
 
     /// круглые нижние углы и вогнутые «плечи» сверху, как у Dynamic Island
     private var cornerRadius: CGFloat {
-        guard model.expanded else { return 10 }
+        guard grown else { return 10 }
         return style == .designer ? 23 : 24
     }
-    private var shoulder: CGFloat { model.expanded ? 12 : 6 }
+    private var shoulder: CGFloat { grown ? 12 : 6 }
 
-    /// Анимация раскрытия под стиль; при «Уменьшить движение» — короткий ease-out без пружины.
+    /// Раскрытие: мягкая пружина ~0.5 с с едва заметным дотягом, закрытие короче и без отскока.
+    /// Контент проявляется с задержкой — сначала форма, потом содержимое (см. contentIn).
     private var expandAnimation: Animation {
-        if reduceMotion { return .easeOut(duration: 0.15) }
+        if reduceMotion { return .easeOut(duration: 0.2) }
+        guard model.expanded else { return .spring(response: 0.38, dampingFraction: 1) }
         switch style {
-        case .classic: return .spring(response: 0.32, dampingFraction: 0.82)
-        case .impeccable: return .spring(response: 0.3, dampingFraction: 1)
-        case .taste: return .spring(response: 0.4, dampingFraction: 0.86)
-        // Emil: без отскока, закрытие быстрее открытия (асимметрия)
-        case .emil, .candy, .designer:
-            return model.expanded ? .spring(response: 0.38, dampingFraction: 1) : .spring(response: 0.24, dampingFraction: 1)
+        case .taste: return .spring(response: 0.52, dampingFraction: 0.84)
+        default: return .spring(response: 0.5, dampingFraction: 0.9)
         }
     }
 
+    /// содержимое раскрытой панели: появляется, когда форма уже почти раскрылась; уходит сразу
+    private var contentIn: AnyTransition {
+        .asymmetric(
+            insertion: .opacity.combined(with: .scale(scale: 0.96, anchor: .top))
+                .animation(.easeOut(duration: 0.28).delay(reduceMotion ? 0 : 0.12)),
+            removal: .opacity.animation(.easeIn(duration: 0.1)))
+    }
+
     var body: some View {
+        Group {
+            if useGlass { glassBody.transition(.opacity) } else { solidBody }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .animation(expandAnimation, value: model.expanded)
+        .animation(.spring(response: 0.38, dampingFraction: 1), value: model.switching)
+        .animation(.easeOut(duration: 0.4), value: player.tint)
+        .animation(.easeInOut(duration: 0.25), value: player.current?.id)
+        .animation(.spring(response: 0.3, dampingFraction: 0.7), value: model.notice)
+        .foregroundColor(.white)
+    }
+
+    // MARK: стекло
+
+    private var glassBody: some View {
+        let e = model.expanded
+        let has = player.current != nil
+        let ch = max(model.notchH - 6, 16)              // высота боковых стёклышек
+        let sw = ch + 8                                  // их ширина
+        let sideX = model.notchW / 2 + 6 + sw / 2        // центр стёклышка от центра выреза
+        return ZStack(alignment: .top) {
+            GlassShell(expanded: e, visible: e || has, W: model.expandedW, H: model.expandedH,
+                       sw: sw, ch: ch, sideX: sideX)
+            // сам вырез — чёрный, стекло его обтекает
+            NotchShape(radius: 10, shoulder: 6)
+                .fill(Color.black)
+                .frame(width: model.notchW + 12, height: model.notchH)
+            if e {
+                GlassExpanded(player: player, top: model.notchH + 14)
+                    .frame(width: model.expandedW)
+                    .transition(contentIn)
+                if let r = updater.available {
+                    HStack {
+                        Spacer()
+                        Button { updater.prompt() } label: {
+                            Label(r.version, systemImage: "arrow.down.circle.fill")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(accent)
+                        }
+                        .buttonStyle(PressStyle())
+                        .help("Вышла Volna \(r.version) — что нового и обновить")
+                        .padding(.trailing, 22)
+                    }
+                    .frame(width: model.expandedW, height: max(model.notchH - 2, 18))
+                    .transition(.opacity)
+                }
+            } else if has {
+                CoverView(image: player.cover, size: ch - 8, radius: 6)
+                    .offset(x: -sideX, y: 3 + 4)
+                    .transition(.opacity)
+                Visualizer(style: .glass, playing: player.isPlaying, meter: player.meter)
+                    .frame(width: sw - 12, height: ch - 12)
+                    .offset(x: sideX, y: 3 + 6)
+                    .transition(.opacity)
+            }
+        }
+        .frame(width: model.expandedW + 24, height: model.expandedH, alignment: .top)
+        .environment(\.colorScheme, .dark)
+    }
+
+    private var solidBody: some View {
         VStack(spacing: 0) {
             ZStack(alignment: .top) {
                 // фон с плечами — шире контента на 2×shoulder
@@ -435,22 +608,26 @@ struct NotchView: View {
                           ? AnyShapeStyle(designerBackground) : AnyShapeStyle(Color.black))
                     .frame(width: width + 2 * shoulder, height: height)
                 if style == .taste && model.expanded && player.loggedIn {
-                    NotchShape(radius: cornerRadius, shoulder: shoulder)
-                        .fill(LinearGradient(colors: [Color.black, (player.tint ?? accent).opacity(0.45)],
-                                             startPoint: .top, endPoint: .bottom))
+                    SunsetGlow(playing: player.isPlaying, meter: player.meter, tint: player.tint ?? accent,
+                               blackTo: model.notchH / max(height, 1))
+                        .clipShape(NotchShape(radius: cornerRadius, shoulder: shoulder))
                         .frame(width: width + 2 * shoulder, height: height)
                         .transition(.opacity)
                 }
                 ZStack(alignment: .top) {
-                if model.expanded && style == .designer && player.loggedIn {
-                    DesignerExpanded(player: player).transition(.opacity)
+                if bare {
+                    Color.clear
+                } else if model.expanded && style == .designer && player.loggedIn {
+                    DesignerExpanded(player: player)
+                        .padding(.top, model.designerShift)
+                        .transition(contentIn)
                 } else if model.expanded {
-                    expandedContent.transition(.opacity)
+                    expandedContent.transition(contentIn)
                 } else if showPill {
                     collapsedContent.transition(.opacity)
                 }
                 // справа от выреза: есть обновление — маленькая кнопка с версией
-                if model.expanded, let r = updater.available {
+                if grown, let r = updater.available {
                     HStack {
                         Spacer()
                         Button { updater.prompt() } label: {
@@ -468,16 +645,11 @@ struct NotchView: View {
                 }
                 .frame(width: width, height: height)
                 .clipShape(NotchShape(radius: cornerRadius))
+                .id(prefs.style)   // смена стиля — пересобрать содержимое с новым акцентом
             }
             .frame(width: width + 2 * shoulder, height: height)
             Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .animation(expandAnimation, value: model.expanded)
-        .animation(.easeOut(duration: 0.4), value: player.tint)
-        .animation(.easeInOut(duration: 0.25), value: player.current?.id)
-        .animation(.spring(response: 0.3, dampingFraction: 0.7), value: model.notice)
-        .foregroundColor(.white)
     }
 
     // MARK: свёрнуто
@@ -509,16 +681,7 @@ struct NotchView: View {
             CoverView(image: player.cover, size: model.notchH - 10, radius: 5)
                 .padding(.leading, 9)
             Spacer(minLength: 0)
-            Group {
-                switch style {
-                case .taste:
-                    MiniWave(playing: player.isPlaying, meter: player.meter, color: player.tint ?? accent)
-                case .impeccable, .candy, .designer:
-                    Bars(playing: player.isPlaying, meter: player.meter, color: Color.white.opacity(0.85))
-                default:
-                    Bars(playing: player.isPlaying, meter: player.meter)
-                }
-            }
+            Visualizer(style: style, playing: player.isPlaying, meter: player.meter, tint: player.tint)
             .frame(width: 23, height: model.notchH - 12)
             .padding(.trailing, 9)
         }
@@ -529,20 +692,14 @@ struct NotchView: View {
 
     private var expandedContent: some View {
         VStack(spacing: 12) {
-            Color.clear.frame(height: max(model.notchH - 6, 0))
+            // явный отступ от выреза до трека
+            Color.clear.frame(height: model.notchH + 6)
             if player.loggedIn {
                 switch style {
-                case .classic:
-                    trackRow
-                    controls
-                case .impeccable:
-                    ImpeccableExpanded(player: player)
                 case .taste:
                     TasteExpanded(player: player)
-                case .emil:
-                    EmilExpanded(player: player)
-                case .candy, .designer:
-                    CandyExpanded(player: player)
+                case .candy, .designer, .glass:
+                    CandyExpanded(player: player, style: style)
                 }
             } else {
                 loginBlock
@@ -660,19 +817,23 @@ struct CoverView: View {
 }
 
 struct Bars: View {
+    static let count = 5
     let playing: Bool
     let meter: LevelMeter
     var color: Color = accent
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !playing)) { _ in
-            let l = playing ? meter.frame() : [Float](repeating: 0, count: LevelMeter.bands)
+            let m = playing ? meter.frame() : meter.idle()
+            let l = m.bars(Self.count)
             GeometryReader { g in
                 HStack(alignment: .center, spacing: 2) {
-                    ForEach(0..<LevelMeter.bands, id: \.self) { i in
+                    ForEach(0..<Self.count, id: \.self) { i in
+                        // удар подбрасывает все столбики, сильнее — низкие
+                        let v = min(CGFloat(l[i]) + CGFloat(m.kick) * (0.3 - 0.05 * CGFloat(i)), 1)
                         Capsule()
-                            .fill(color.opacity(0.55 + 0.45 * Double(l[i])))
-                            .frame(width: 3, height: 3 + (g.size.height - 3) * CGFloat(l[i]))
+                            .fill(color.opacity(0.5 + 0.5 * Double(v)))
+                            .frame(width: 3, height: 3 + (g.size.height - 3) * v)
                     }
                 }
                 .frame(width: g.size.width, height: g.size.height)
