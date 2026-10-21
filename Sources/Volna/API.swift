@@ -14,6 +14,9 @@ struct Track: Equatable, Codable {
     let artists: String
     let coverUri: String?
     let durationMs: Int
+    /// громкость трека по EBU R128 (интегральная, LUFS) и истинный пик (dBTP) — для выравнивания
+    var lufs: Double? = nil
+    var peak: Double? = nil
 
     var key: String { albumId.map { "\(id):\($0)" } ?? id }
 
@@ -29,13 +32,16 @@ struct Track: Equatable, Codable {
         let artists = (d["artists"] as? [[String: Any]])?
             .compactMap { $0["name"] as? String }
             .joined(separator: ", ") ?? ""
+        let r128 = d["r128"] as? [String: Any]
         return Track(
             id: id,
             albumId: anyStr(album?["id"]),
             title: d["title"] as? String ?? "—",
             artists: artists,
             coverUri: (d["coverUri"] as? String) ?? (album?["coverUri"] as? String),
-            durationMs: (d["durationMs"] as? NSNumber)?.intValue ?? 0
+            durationMs: (d["durationMs"] as? NSNumber)?.intValue ?? 0,
+            lufs: (r128?["i"] as? NSNumber)?.doubleValue,
+            peak: (r128?["tp"] as? NSNumber)?.doubleValue
         )
     }
 }
@@ -146,6 +152,96 @@ final class YaAPI {
 
     func dislike(uid: Int, track: Track) async throws {
         try await call("POST", "/users/\(uid)/dislikes/tracks/add-multiple", form: ["track-ids": track.key])
+    }
+
+    // MARK: библиотека
+
+    struct Playlist {
+        let kind: Int
+        let title: String
+        let count: Int
+    }
+
+    /// «Мне нравится» в порядке добавления (новые сверху), полные данные треков — до limit штук.
+    func likedTracks(uid: Int, limit: Int = 500) async throws -> [Track] {
+        let r = try await call("GET", "/users/\(uid)/likes/tracks")
+        let lib = (r as? [String: Any])?["library"] as? [String: Any]
+        let items = (lib?["tracks"] as? [[String: Any]] ?? []).prefix(limit)
+        let keys: [String] = items.compactMap { t in
+            guard let id = anyStr(t["id"]) else { return nil }
+            return anyStr(t["albumId"]).map { "\(id):\($0)" } ?? id
+        }
+        return try await tracks(keys)
+    }
+
+    /// Полные треки по ключам id:albumId, порциями по 100, порядок сохраняется.
+    func tracks(_ keys: [String]) async throws -> [Track] {
+        var out: [Track] = []
+        var i = 0
+        while i < keys.count {
+            let part = Array(keys[i..<min(i + 100, keys.count)])
+            let r = try await call("POST", "/tracks", form: ["track-ids": part.joined(separator: ",")])
+            out += (r as? [Any] ?? []).compactMap { Track.parse($0) }
+            i += 100
+        }
+        return out
+    }
+
+    func playlists(uid: Int) async throws -> [Playlist] {
+        let r = try await call("GET", "/users/\(uid)/playlists/list")
+        return (r as? [[String: Any]] ?? []).compactMap { d in
+            guard let kind = (d["kind"] as? NSNumber)?.intValue else { return nil }
+            return Playlist(kind: kind, title: d["title"] as? String ?? "Плейлист",
+                            count: (d["trackCount"] as? NSNumber)?.intValue ?? 0)
+        }
+    }
+
+    func playlistTracks(uid: Int, kind: Int) async throws -> [Track] {
+        let r = try await call("GET", "/users/\(uid)/playlists/\(kind)", query: ["rich-tracks": "true"])
+        let items = (r as? [String: Any])?["tracks"] as? [[String: Any]] ?? []
+        return items.compactMap { Track.parse($0["track"]) }
+    }
+
+    struct Artist: Equatable {
+        let id: String
+        let name: String
+        let coverUri: String?
+
+        func coverURL(_ size: Int = 100) -> URL? {
+            guard let c = coverUri else { return nil }
+            return URL(string: "https://" + c.replacingOccurrences(of: "%%", with: "\(size)x\(size)"))
+        }
+
+        static func parse(_ any: Any?) -> Artist? {
+            guard let d = any as? [String: Any], let id = anyStr(d["id"]), let name = d["name"] as? String else { return nil }
+            let cover = (d["cover"] as? [String: Any])?["uri"] as? String
+            return Artist(id: id, name: name, coverUri: cover ?? (d["ogImage"] as? String))
+        }
+    }
+
+    /// Поиск сразу по трекам и исполнителям; bestArtist — Яндекс считает лучшим совпадением исполнителя.
+    func search(_ text: String) async throws -> (tracks: [Track], artists: [Artist], bestArtist: Bool) {
+        let r = try await call("GET", "/search", query: ["text": text, "type": "all", "page": "0", "nocorrect": "false"])
+        let d = r as? [String: Any]
+        let tr = (d?["tracks"] as? [String: Any])?["results"] as? [Any] ?? []
+        let ar = (d?["artists"] as? [String: Any])?["results"] as? [Any] ?? []
+        let bestD = d?["best"] as? [String: Any]
+        let best = bestD?["type"] as? String
+        var artists = ar.compactMap { Artist.parse($0) }
+        // лучший результат — исполнитель: он первым, даже если в списке исполнителей его нет
+        if best == "artist", let a = Artist.parse(bestD?["result"]) {
+            artists.removeAll { $0.id == a.id }
+            artists.insert(a, at: 0)
+        }
+        ylog("search «\(text)»: треков \(tr.count), исполнителей \(artists.count), best=\(best ?? "-") \(artists.prefix(3).map(\.name))")
+        return (tr.compactMap { Track.parse($0) }, artists, best == "artist")
+    }
+
+    /// Популярные треки исполнителя.
+    func artistTracks(_ id: String) async throws -> [Track] {
+        let r = try await call("GET", "/artists/\(id)/tracks", query: ["page": "0", "page-size": "50"])
+        let items = (r as? [String: Any])?["tracks"] as? [Any] ?? []
+        return items.compactMap { Track.parse($0) }
     }
 
     // MARK: поток

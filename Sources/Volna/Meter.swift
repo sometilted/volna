@@ -256,20 +256,24 @@ final class LevelMeter: @unchecked Sendable {
         }
     }
 
-    /// Вешает tap на аудиодорожку item. Если не вышло — пишет в лог, звук не трогается.
-    func attach(to item: AVPlayerItem) {
+    /// Вешает tap на аудиодорожку item: анализ для визуализатора + усиление gain (выравнивание громкости).
+    /// Возвращает контекст, через который gain можно поменять на лету. Если не вышло — звук не трогается.
+    @discardableResult
+    func attach(to item: AVPlayerItem, gain: Float = 1) -> TapContext {
+        let ctx = TapContext(meter: self, gain: gain)
         let asset = item.asset
-        let ptr = Unmanaged.passUnretained(self).toOpaque()
         Task {
             guard let track = try? await asset.loadTracks(withMediaType: .audio).first else {
                 ylog("meter: нет аудиодорожки")
                 return
             }
+            // контекст живёт, пока жив tap: retain здесь, release в finalize
+            let ptr = Unmanaged.passRetained(ctx).toOpaque()
             var cb = MTAudioProcessingTapCallbacks(
                 version: kMTAudioProcessingTapCallbacksVersion_0,
                 clientInfo: ptr,
                 init: tapInit,
-                finalize: nil,
+                finalize: tapFinalize,
                 prepare: tapPrepare,
                 unprepare: nil,
                 process: tapProcess
@@ -278,6 +282,7 @@ final class LevelMeter: @unchecked Sendable {
             let st = MTAudioProcessingTapCreate(kCFAllocatorDefault, &cb,
                                                 kMTAudioProcessingTapCreationFlag_PostEffects, &tap)
             guard st == noErr, let tap = tap else {
+                Unmanaged<TapContext>.fromOpaque(ptr).release()
                 ylog("meter: tap create \(st)")
                 return
             }
@@ -287,26 +292,67 @@ final class LevelMeter: @unchecked Sendable {
             mix.inputParameters = [params]
             await MainActor.run { item.audioMix = mix }
         }
+        return ctx
     }
 }
 
-// C-колбэки: без захвата контекста, LevelMeter достаём из storage тапа.
-// LevelMeter живёт всё время работы приложения (свойство Player), поэтому unretained безопасен.
+/// Состояние одного тапа (одного трека): куда слать анализ и какое усиление применять.
+final class TapContext: @unchecked Sendable {
+    let meter: LevelMeter
+    /// целевое усиление, линейное; меняется с главного потока (запись Float атомарна на arm64/x86_64)
+    var gain: Float
+    fileprivate var cur: Float
+    fileprivate var isFloat = true
+
+    init(meter: LevelMeter, gain: Float) {
+        self.meter = meter
+        self.gain = gain
+        self.cur = gain
+    }
+
+    /// Усиление с плавным переходом (без щелчков) и жёстким ограничителем на ±1.
+    fileprivate func apply(_ abl: UnsafeMutablePointer<AudioBufferList>, frames: Int) {
+        let g = gain
+        if abs(g - 1) < 0.001 && abs(cur - 1) < 0.001 { return }
+        let start = cur
+        let step = (g - start) / Float(max(frames, 1))
+        for b in UnsafeMutableAudioBufferListPointer(abl) {
+            guard let p = b.mData?.assumingMemoryBound(to: Float.self) else { continue }
+            let ch = max(Int(b.mNumberChannels), 1)
+            let n = min(Int(b.mDataByteSize) / 4, frames * ch)
+            var k = start
+            for i in 0..<n {
+                if i % ch == 0 { k += step }
+                p[i] = min(max(p[i] * k, -1), 1)
+            }
+        }
+        cur = g
+    }
+}
+
+// C-колбэки: без захвата контекста, TapContext достаём из storage тапа.
 
 private let tapInit: MTAudioProcessingTapInitCallback = { _, clientInfo, storageOut in
     storageOut.pointee = clientInfo
 }
 
+private let tapFinalize: MTAudioProcessingTapFinalizeCallback = { tap in
+    Unmanaged<TapContext>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).release()
+}
+
 private let tapPrepare: MTAudioProcessingTapPrepareCallback = { tap, _, asbd in
-    let m = Unmanaged<LevelMeter>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).takeUnretainedValue()
+    let c = Unmanaged<TapContext>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).takeUnretainedValue()
     let f = asbd.pointee
     let isFloat = (f.mFormatFlags & kAudioFormatFlagIsFloat) != 0 && f.mBitsPerChannel == 32
-    m.prepare(sampleRate: f.mSampleRate, isFloat: isFloat)
+    c.isFloat = isFloat
+    c.meter.prepare(sampleRate: f.mSampleRate, isFloat: isFloat)
 }
 
 private let tapProcess: MTAudioProcessingTapProcessCallback = { tap, frames, _, abl, framesOut, flagsOut in
     let st = MTAudioProcessingTapGetSourceAudio(tap, frames, abl, flagsOut, nil, framesOut)
     guard st == noErr else { return }
-    let m = Unmanaged<LevelMeter>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).takeUnretainedValue()
-    m.process(abl, frames: Int(framesOut.pointee))
+    let c = Unmanaged<TapContext>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).takeUnretainedValue()
+    let n = Int(framesOut.pointee)
+    if c.isFloat { c.apply(abl, frames: n) }
+    c.meter.process(abl, frames: n)
 }

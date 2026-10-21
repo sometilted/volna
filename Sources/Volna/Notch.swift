@@ -23,6 +23,8 @@ final class NotchModel: ObservableObject {
     @Published var peeking = false
     /// идёт вход по коду — панель держим открытой
     @Published var pinned = false
+    /// нотч раскрыт в поиск: держит клавиатуру, не сворачивается от мыши
+    @Published var searching = false
     /// короткое уведомление в свёрнутом нотче (иконка + текст)
     @Published var notice: Notice?
     @Published var notchW: CGFloat = 0
@@ -54,6 +56,13 @@ final class NotchPanel: NSPanel {
     var allowKey = false
     override var canBecomeKey: Bool { allowKey }
     override var canBecomeMain: Bool { false }
+}
+
+/// Команды из SwiftUI в контроллер (шестерёнка открывает то же меню, что правый клик).
+@MainActor
+final class NotchCommands {
+    static let shared = NotchCommands()
+    var openMenu: (() -> Void)?
 }
 
 @MainActor
@@ -113,9 +122,10 @@ final class NotchController: MenuSource {
     private var peekWork: DispatchWorkItem?
     private var noticeWork: DispatchWorkItem?
     private let tg = TelegramWatcher()
+    private let calls = CallWatcher()
     private let actions: NotchActions
     private let panelW: CGFloat = 440
-    private let panelH: CGFloat = 240
+    private let panelH: CGFloat = 420
     /// пока открыто контекстное меню, наведение не сворачивает панель (курсор уходит в меню)
     private var menuOpen = false
 
@@ -159,6 +169,18 @@ final class NotchController: MenuSource {
             }
             return e
         }) { monitors.append(m) }
+        // клик мимо нотча — закрыть поиск
+        if let m = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: { [weak self] _ in
+            MainActor.assumeIsolated { if self?.model.searching == true { self?.closeSearch() } }
+        }) { monitors.append(m) }
+        let sm = SearchModel.shared
+        sm.player = player
+        sm.onOpen = { [weak self] in self?.openSearch() }
+        sm.onClose = { [weak self] in self?.closeSearch() }
+        NotchCommands.shared.openMenu = { [weak self] in
+            guard let self = self, let e = NSApp.currentEvent, let v = self.panel.contentView else { return }
+            _ = self.popMenu(with: e, for: v)
+        }
         if let m = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { [weak self] e in
             MainActor.assumeIsolated { (self?.handleKey(e) ?? false) ? nil : e }
         }) { monitors.append(m) }
@@ -187,6 +209,10 @@ final class NotchController: MenuSource {
             self?.notify(icon: img, text: r.version, seconds: 4)
         }
         if Prefs.shared.tgNotify { tg.start() }
+        // авто-пауза молча: без всплывашек в нотче
+        calls.onChange = { [weak self] busy in _ = self?.player.micChanged(busy) }
+        calls.onOther = { [weak self] on, _ in _ = self?.player.otherAudio(on) }
+        calls.update(mic: Prefs.shared.callPause, other: Prefs.shared.otherPause)
 
         Prefs.shared.$style
             .map { UIStyle.from($0) }
@@ -236,6 +262,24 @@ final class NotchController: MenuSource {
         }
         let player = self.player
         if player.loggedIn {
+            // что играть
+            m.add("Моя волна", checked: player.source == .wave) { player.playWave() }
+            m.add("Мне нравится", checked: player.source == .list("Мне нравится")) { player.playLikes() }
+            let lists = player.playlists.filter { $0.count > 0 }
+            if !lists.isEmpty {
+                m.submenu("Плейлисты") { sub in
+                    for pl in lists {
+                        sub.add("\(pl.title) · \(pl.count)", checked: player.source == .list(pl.title)) {
+                            player.playPlaylist(pl)
+                        }
+                    }
+                }
+            }
+            let s = m.add("Поиск…") { [weak self] in self?.openSearch() }
+            s.keyEquivalent = "f"
+            s.keyEquivalentModifierMask = .command
+            m.add("Вперемешку", checked: p.shuffle) { p.shuffle.toggle() }
+            m.addItem(.separator())
             let wave: (String, [(String, String)], ReferenceWritableKeyPath<Prefs, String>) -> Void = { title, opts, kp in
                 m.submenu(title) { sub in
                     for (name, value) in opts {
@@ -264,6 +308,19 @@ final class NotchController: MenuSource {
             it.keyEquivalentModifierMask = .command
         }
         m.addItem(.separator())
+        m.add("Выравнивать громкость", checked: p.normalize) {
+            p.normalize.toggle()
+            player.applyNormalize()
+        }
+        let calls = self.calls
+        m.add("Пауза на созвонах", checked: p.callPause) {
+            p.callPause.toggle()
+            calls.update(mic: p.callPause, other: p.otherPause)
+        }
+        m.add("Пауза, когда играет другое", checked: p.otherPause) {
+            p.otherPause.toggle()
+            calls.update(mic: p.callPause, other: p.otherPause)
+        }
         m.add("Показывать смену трека", checked: p.peek) { p.peek.toggle() }
         let tg = self.tg
         m.add("Сообщения Telegram в нотче", checked: p.tgNotify) {
@@ -313,7 +370,7 @@ final class NotchController: MenuSource {
 
     private func track() {
         let p = NSEvent.mouseLocation
-        if model.pinned || menuOpen || model.switching { return }
+        if model.pinned || menuOpen || model.switching || model.searching { return }
         if model.peeking {
             // мышь зашла в выехавшую панель — превращаем пик в обычное раскрытие
             if expandedRect.contains(p) {
@@ -337,8 +394,12 @@ final class NotchController: MenuSource {
     /// ⌘1…⌘4 — стиль, пробел — пауза, ←/→ — трек, Esc — свернуть.
     /// Любая другая клавиша: отдаём фокус и пересылаем её системе — она попадёт туда, где печатали.
     private func handleKey(_ e: NSEvent) -> Bool {
-        guard e.window === panel else { return false }
+        guard e.window === panel, !model.searching else { return false }
         let mods = e.modifierFlags.intersection([.command, .option, .control, .shift])
+        if mods == .command, e.charactersIgnoringModifiers == "f", player.loggedIn {
+            openSearch()
+            return true
+        }
         if mods == .command, let c = e.charactersIgnoringModifiers, let n = Int(c),
            n >= 1, n <= UIStyle.allCases.count {
             switchStyle(UIStyle.allCases[n - 1])
@@ -359,6 +420,27 @@ final class NotchController: MenuSource {
         return true
     }
 
+    /// Нотч раскрывается в поиск и берёт клавиатуру (панель не активирует приложение — как Spotlight).
+    func openSearch() {
+        guard player.loggedIn else { return }
+        peekWork?.cancel()
+        model.peeking = false
+        SearchModel.shared.reset()
+        model.searching = true
+        model.expanded = true
+        panel.ignoresMouseEvents = false
+        panel.allowKey = true
+        panel.makeKey()
+    }
+
+    func closeSearch() {
+        guard model.searching else { return }
+        model.searching = false
+        releaseKey()
+        // мышь уже не над нотчем — свернуть
+        if !expandedRect.contains(NSEvent.mouseLocation) { setExpanded(false) }
+    }
+
     /// Вернуть клавиатуру приложению, в котором работали.
     private func releaseKey() {
         panel.allowKey = false
@@ -371,7 +453,7 @@ final class NotchController: MenuSource {
     private func setExpanded(_ v: Bool) {
         peekWork?.cancel()
         model.peeking = false
-        if !v { releaseKey() }
+        if !v { model.searching = false; releaseKey() }
         guard model.expanded != v else { return }
         if v { revealSoon() } else { Reveal.shared.on = false; HoverModel.shared.key = nil }
         model.expanded = v
@@ -488,6 +570,7 @@ struct NotchView: View {
     @ObservedObject var prefs: Prefs
     let actions: NotchActions
     @ObservedObject private var updater = Updater.shared
+    @ObservedObject private var search = SearchModel.shared
 
     private var showPill: Bool { player.current != nil || !player.loggedIn || model.notice != nil }
     private var style: UIStyle { UIStyle.from(prefs.style) }
@@ -540,15 +623,96 @@ struct NotchView: View {
 
     var body: some View {
         Group {
-            if useGlass { glassBody.transition(.opacity) } else { solidBody }
+            if model.searching { searchBody.transition(.opacity) }
+            else if useGlass { glassBody.transition(.opacity) } else { solidBody }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .animation(expandAnimation, value: model.expanded)
         .animation(.spring(response: 0.38, dampingFraction: 1), value: model.switching)
+        .animation(.spring(response: 0.42, dampingFraction: 0.88), value: model.searching)
         .animation(.easeOut(duration: 0.4), value: player.tint)
         .animation(.easeInOut(duration: 0.25), value: player.current?.id)
         .animation(.spring(response: 0.3, dampingFraction: 0.7), value: model.notice)
         .foregroundColor(.white)
+    }
+
+    // MARK: превью смены трека
+
+    /// Новый трек: крупная обложка, название и исполнитель крупно, без кнопок.
+    /// Мышь зашла в нотч — превью превращается в обычную панель с управлением.
+    private func peekContent(top: CGFloat) -> some View {
+        let side = max(min(model.expandedH - top - 14, 120), 60)
+        return VStack(spacing: 0) {
+            Color.clear.frame(height: top)
+            HStack(spacing: 16) {
+                CoverView(image: player.cover, size: side, radius: side * 0.14)
+                    .shadow(color: Color.black.opacity(0.45), radius: 12, y: 5)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(player.current?.title ?? "")
+                        .font(.system(size: 20, weight: .bold))
+                        .tracking(-0.4)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.75)
+                    Text(player.current?.artists ?? "")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundColor(accent)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                    if case .list(let name) = player.source {
+                        Text(name)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(Color.white.opacity(0.45))
+                            .lineLimit(1)
+                            .padding(.top, 2)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.horizontal, 22)
+            Spacer(minLength: 0)
+        }
+        .id(player.current?.id)
+    }
+
+    // MARK: поиск
+
+    private var searchBody: some View {
+        let empty = search.query.trimmingCharacters(in: .whitespaces).isEmpty
+        let rows = search.shown.count
+        let h = SearchPanel.height(notchH: model.notchH, rows: rows, header: empty && rows > 0)
+        let w = model.expandedW + 20
+        return ZStack(alignment: .top) {
+            NotchShape(radius: 24, shoulder: 12)
+                .fill(style == .designer ? AnyShapeStyle(designerBackground) : AnyShapeStyle(Color.black))
+                .frame(width: w + 24, height: h)
+            SearchPanel(model: search, player: player, top: model.notchH + 8, accent: accent)
+                .frame(width: w, height: h)
+                .clipShape(NotchShape(radius: 24))
+        }
+        .frame(width: w + 24, height: h)
+        .animation(.spring(response: 0.35, dampingFraction: 0.9), value: h)
+    }
+
+    /// Верхний ряд по бокам выреза — зеркало нижнего: лупа над дизлайком, шестерёнка над лайком,
+    /// тот же размер и тот же отступ от края; по высоте — по центру полосы выреза.
+    /// Есть обновление — кнопка с версией рядом с шестерёнкой.
+    private var cornerButtons: some View {
+        HStack(spacing: 4) {
+            EmilButton(icon: "magnifyingglass", label: "Поиск (⌘F)", size: 13, dim: true) { search.open() }
+            Spacer()
+            if let r = updater.available {
+                Button { updater.prompt() } label: {
+                    Label(r.version, systemImage: "arrow.down.circle.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(accent)
+                }
+                .buttonStyle(PressStyle())
+                .help("Вышла Volna \(r.version) — что нового и обновить")
+            }
+            EmilButton(icon: "gearshape", label: "Настройки", size: 13, dim: true) { NotchCommands.shared.openMenu?() }
+        }
+        .padding(.horizontal, 20)
+        .frame(width: model.expandedW, height: model.notchH)
     }
 
     // MARK: стекло
@@ -566,25 +730,15 @@ struct NotchView: View {
             NotchShape(radius: 10, shoulder: 6)
                 .fill(Color.black)
                 .frame(width: model.notchW + 12, height: model.notchH)
-            if e {
+            if e && model.peeking && player.current != nil {
+                peekContent(top: model.notchH + 12)
+                    .frame(width: model.expandedW)
+                    .transition(contentIn)
+            } else if e {
                 GlassExpanded(player: player, top: model.notchH + 14)
                     .frame(width: model.expandedW)
                     .transition(contentIn)
-                if let r = updater.available {
-                    HStack {
-                        Spacer()
-                        Button { updater.prompt() } label: {
-                            Label(r.version, systemImage: "arrow.down.circle.fill")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundColor(accent)
-                        }
-                        .buttonStyle(PressStyle())
-                        .help("Вышла Volna \(r.version) — что нового и обновить")
-                        .padding(.trailing, 22)
-                    }
-                    .frame(width: model.expandedW, height: max(model.notchH - 2, 18))
-                    .transition(.opacity)
-                }
+                cornerButtons.transition(.opacity)
             } else if has {
                 CoverView(image: player.cover, size: ch - 8, radius: 6)
                     .offset(x: -sideX, y: 3 + 4)
@@ -617,6 +771,8 @@ struct NotchView: View {
                 ZStack(alignment: .top) {
                 if bare {
                     Color.clear
+                } else if model.expanded && model.peeking && player.current != nil {
+                    peekContent(top: model.notchH + 10).transition(contentIn)
                 } else if model.expanded && style == .designer && player.loggedIn {
                     DesignerExpanded(player: player)
                         .padding(.top, model.designerShift)
@@ -626,21 +782,8 @@ struct NotchView: View {
                 } else if showPill {
                     collapsedContent.transition(.opacity)
                 }
-                // справа от выреза: есть обновление — маленькая кнопка с версией
-                if grown, let r = updater.available {
-                    HStack {
-                        Spacer()
-                        Button { updater.prompt() } label: {
-                            Label(r.version, systemImage: "arrow.down.circle.fill")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundColor(accent)
-                        }
-                        .buttonStyle(PressStyle())
-                        .help("Вышла Volna \(r.version) — что нового и обновить")
-                        .padding(.trailing, 18)
-                    }
-                    .frame(height: max(model.notchH - 6, 18))
-                    .transition(.opacity)
+                if grown && player.loggedIn && !model.peeking {
+                    cornerButtons.transition(.opacity)
                 }
                 }
                 .frame(width: width, height: height)

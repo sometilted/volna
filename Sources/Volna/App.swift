@@ -100,6 +100,14 @@ final class Prefs: ObservableObject {
     /// language: any | russian | not-russian
     @Published var language: String { didSet { d.set(language, forKey: "language") } }
     @Published var launchAtLogin: Bool
+    /// выравнивать громкость треков (R128)
+    @Published var normalize: Bool { didSet { d.set(normalize, forKey: "normalize") } }
+    /// пауза, пока микрофон занят созвоном
+    @Published var callPause: Bool { didSet { d.set(callPause, forKey: "callPause") } }
+    /// пауза, пока другое приложение играет звук (ролик, голосовое, YouTube)
+    @Published var otherPause: Bool { didSet { d.set(otherPause, forKey: "otherPause") } }
+    /// списки (Мне нравится, плейлисты) — вперемешку
+    @Published var shuffle: Bool { didSet { d.set(shuffle, forKey: "shuffle") } }
 
     private init() {
         peek = d.object(forKey: "peek") as? Bool ?? true
@@ -109,6 +117,10 @@ final class Prefs: ObservableObject {
         diversity = d.string(forKey: "diversity") ?? "default"
         language = d.string(forKey: "language") ?? "any"
         launchAtLogin = SMAppService.mainApp.status == .enabled
+        normalize = d.object(forKey: "normalize") as? Bool ?? true
+        callPause = d.object(forKey: "callPause") as? Bool ?? true
+        otherPause = d.object(forKey: "otherPause") as? Bool ?? true
+        shuffle = d.object(forKey: "shuffle") as? Bool ?? false
     }
 
     var waveIsDefault: Bool { mood == "all" && diversity == "default" && language == "any" }
