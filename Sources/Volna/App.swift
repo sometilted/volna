@@ -106,6 +106,8 @@ final class Prefs: ObservableObject {
     @Published var callPause: Bool { didSet { d.set(callPause, forKey: "callPause") } }
     /// пауза, пока другое приложение играет звук (ролик, голосовое, YouTube)
     @Published var otherPause: Bool { didSet { d.set(otherPause, forKey: "otherPause") } }
+    /// громкость и яркость показывать в нотче вместо системной плашки
+    @Published var hudKeys: Bool { didSet { d.set(hudKeys, forKey: "hudKeys") } }
     /// списки (Мне нравится, плейлисты) — вперемешку
     @Published var shuffle: Bool { didSet { d.set(shuffle, forKey: "shuffle") } }
 
@@ -120,6 +122,7 @@ final class Prefs: ObservableObject {
         normalize = d.object(forKey: "normalize") as? Bool ?? true
         callPause = d.object(forKey: "callPause") as? Bool ?? true
         otherPause = d.object(forKey: "otherPause") as? Bool ?? true
+        hudKeys = d.object(forKey: "hudKeys") as? Bool ?? true
         shuffle = d.object(forKey: "shuffle") as? Bool ?? false
     }
 

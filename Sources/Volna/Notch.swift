@@ -27,6 +27,8 @@ final class NotchModel: ObservableObject {
     @Published var searching = false
     /// короткое уведомление в свёрнутом нотче (иконка + текст)
     @Published var notice: Notice?
+    /// громкость / яркость — показываем ~1.5 с вместо системной плашки
+    @Published var hud: HUD?
     @Published var notchW: CGFloat = 0
     @Published var notchH: CGFloat = 32
     let expandedW: CGFloat = 400
@@ -123,6 +125,8 @@ final class NotchController: MenuSource {
     private var noticeWork: DispatchWorkItem?
     private let tg = TelegramWatcher()
     private let calls = CallWatcher()
+    private let keys = MediaKeys()
+    private var hudWork: DispatchWorkItem?
     private let actions: NotchActions
     private let panelW: CGFloat = 440
     private let panelH: CGFloat = 420
@@ -213,6 +217,8 @@ final class NotchController: MenuSource {
         calls.onChange = { [weak self] busy in _ = self?.player.micChanged(busy) }
         calls.onOther = { [weak self] on, _ in _ = self?.player.otherAudio(on) }
         calls.update(mic: Prefs.shared.callPause, other: Prefs.shared.otherPause)
+        keys.onChange = { [weak self] h in self?.showHUD(h) }
+        if Prefs.shared.hudKeys { keys.start() }
 
         Prefs.shared.$style
             .map { UIStyle.from($0) }
@@ -322,6 +328,11 @@ final class NotchController: MenuSource {
             calls.update(mic: p.callPause, other: p.otherPause)
         }
         m.add("Показывать смену трека", checked: p.peek) { p.peek.toggle() }
+        let keys = self.keys
+        m.add("Громкость и яркость в нотче", checked: p.hudKeys) {
+            p.hudKeys.toggle()
+            if p.hudKeys { keys.start() } else { keys.stop() }
+        }
         let tg = self.tg
         m.add("Сообщения Telegram в нотче", checked: p.tgNotify) {
             p.tgNotify.toggle()
@@ -466,6 +477,17 @@ final class NotchController: MenuSource {
         DispatchQueue.main.async { Reveal.shared.on = true }
     }
 
+    /// Громкость / яркость: свёрнутый нотч расширяется и показывает значение, через 1.5 с без нажатий — прячет.
+    private func showHUD(_ h: HUD) {
+        model.hud = h
+        hudWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.model.hud = nil }
+        }
+        hudWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: w)
+    }
+
     /// На ~2.5 с показывает иконку и текст в свёрнутом нотче; если панель раскрыта — не мешаем.
     private func notify(icon: NSImage, text: String, seconds: Double = 2.5) {
         guard !model.expanded || model.peeking else { return }
@@ -572,18 +594,22 @@ struct NotchView: View {
     @ObservedObject private var updater = Updater.shared
     @ObservedObject private var search = SearchModel.shared
 
-    private var showPill: Bool { player.current != nil || !player.loggedIn || model.notice != nil }
+    private var showPill: Bool { player.current != nil || !player.loggedIn || model.notice != nil || model.hud != nil }
+    /// на сколько шире свёрнутый нотч, пока показывает громкость / яркость
+    private var hudExtra: CGFloat { model.hud != nil && !model.expanded ? 110 : 0 }
     private var style: UIStyle { UIStyle.from(prefs.style) }
     /// Стекло: свёрнуто — два стёклышка слева и справа от выреза, раскрыто — одно цельное стекло
     private var glassMode: Bool { style == .glass && player.loggedIn }
     /// уведомление Telegram в свёрнутом виде показываем обычной чёрной таблеткой
-    private var useGlass: Bool { glassMode && !model.switching && (model.expanded || model.notice == nil) }
+    private var useGlass: Bool {
+        glassMode && !model.switching && (model.expanded || (model.notice == nil && model.hud == nil))
+    }
     private var grown: Bool { model.expanded && !model.switching }
     /// свернуться в голый вырез при смене стиля
     private var bare: Bool { model.switching }
     private var width: CGFloat {
         if bare { return model.notchW }
-        return grown ? model.expandedW : model.collapsedW(hasTrack: showPill)
+        return grown ? model.expandedW : model.collapsedW(hasTrack: showPill) + hudExtra
     }
     private var height: CGFloat { grown ? model.expandedH : model.notchH }
     /// фон стиля «@opiatolove»: чёрный → #0B0A0A (55%) → #282320, непрозрачный
@@ -633,6 +659,7 @@ struct NotchView: View {
         .animation(.easeOut(duration: 0.4), value: player.tint)
         .animation(.easeInOut(duration: 0.25), value: player.current?.id)
         .animation(.spring(response: 0.3, dampingFraction: 0.7), value: model.notice)
+        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: model.hud != nil)
         .foregroundColor(.white)
     }
 
@@ -798,7 +825,9 @@ struct NotchView: View {
     // MARK: свёрнуто
 
     @ViewBuilder private var collapsedContent: some View {
-        if let n = model.notice {
+        if let h = model.hud {
+            hudView(h)
+        } else if let n = model.notice {
             HStack(spacing: 0) {
                 Image(nsImage: n.icon)
                     .resizable()
@@ -817,6 +846,45 @@ struct NotchView: View {
         } else {
             trackPill
         }
+    }
+
+    /// Слева от выреза — иконка и проценты, справа — полоска в цвете акцента.
+    private func hudView(_ h: HUD) -> some View {
+        let icon: String
+        switch h.kind {
+        case .volume:
+            icon = h.muted ? "speaker.slash.fill"
+                : h.value < 0.34 ? "speaker.wave.1.fill" : h.value < 0.67 ? "speaker.wave.2.fill" : "speaker.wave.3.fill"
+        case .brightness:
+            icon = h.value < 0.5 ? "sun.min.fill" : "sun.max.fill"
+        }
+        let shown = h.muted ? 0 : h.value
+        return HStack(spacing: 0) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(h.muted ? Color.white.opacity(0.5) : .white)
+                .frame(width: 22)
+                .padding(.leading, 12)
+                .modifier(SymbolSwap())
+            Text(h.muted ? "выкл" : "\(Int((shown * 100).rounded()))")
+                .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                .foregroundColor(Color.white.opacity(0.75))
+                .frame(width: 36, alignment: .leading)
+                .padding(.leading, 4)
+            Spacer(minLength: 0)
+            GeometryReader { g in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.18))
+                    Capsule().fill(accent)
+                        .frame(width: g.size.width * CGFloat(shown))
+                }
+            }
+            .frame(width: 70, height: 5)
+            .padding(.trailing, 14)
+        }
+        .frame(height: model.notchH)
+        .animation(.spring(response: 0.25, dampingFraction: 0.85), value: h)
+        .transition(.opacity)
     }
 
     private var trackPill: some View {

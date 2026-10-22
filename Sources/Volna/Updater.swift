@@ -30,9 +30,17 @@ final class Updater: ObservableObject {
             ylog("update: репозиторий не настроен, проверка выключена")
             return
         }
-        // первая проверка через 10 с после запуска, дальше раз в час смотрим, прошли ли сутки (переживает сон)
+        // при запуске — всегда (через 10 с), дальше раз в час смотрим, прошло ли 3 часа, и сразу после сна
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
-            MainActor.assumeIsolated { self?.checkIfDue() }
+            MainActor.assumeIsolated { self?.check(manual: false) }
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            // после пробуждения сеть поднимается не сразу
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+                MainActor.assumeIsolated { self?.checkIfDue() }
+            }
         }
         let t = Timer(timeInterval: 3600, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.checkIfDue() }
@@ -44,7 +52,7 @@ final class Updater: ObservableObject {
 
     private func checkIfDue() {
         let last = d.double(forKey: "updateLastCheck")
-        if Date().timeIntervalSince1970 - last >= 86_400 { check(manual: false) }
+        if Date().timeIntervalSince1970 - last >= 3 * 3600 { check(manual: false) }
     }
 
     func check(manual: Bool) {
@@ -122,10 +130,24 @@ final class Updater: ObservableObject {
         let a = NSAlert()
         a.messageText = "Вышла Volna \(r.version)"
         a.informativeText = "Сейчас у тебя \(Self.current). Что нового:"
-        let sv = NSScrollView(frame: NSRect(x: 0, y: 0, width: 380, height: 180))
+        // Текстовое поле внутри прокрутки настроено полностью: растёт по высоте под текст, ширина — по окну.
+        // Без этого NSTextView оставался высотой 180 и при прокрутке перерисовывался кусками (глюки).
+        let w: CGFloat = 380
+        let sv = NSScrollView(frame: NSRect(x: 0, y: 0, width: w, height: 180))
         sv.hasVerticalScroller = true
+        sv.autohidesScrollers = true
+        sv.borderType = .noBorder
         sv.drawsBackground = false
-        let tv = NSTextView(frame: sv.bounds)
+        sv.contentView.drawsBackground = false
+        let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: w, height: 180))
+        tv.minSize = NSSize(width: 0, height: 0)
+        tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
+        tv.textContainer?.containerSize = NSSize(width: w, height: CGFloat.greatestFiniteMagnitude)
+        tv.textContainer?.widthTracksTextView = true
+        tv.textContainerInset = NSSize(width: 0, height: 4)
+        tv.isSelectable = true
         // markdown из релиза показываем чистым текстом: без **, ` и ``` (списки «- » оставляем)
         let clean = r.notes
             .replacingOccurrences(of: "```", with: "")
@@ -136,8 +158,16 @@ final class Updater: ObservableObject {
         tv.isEditable = false
         tv.drawsBackground = false
         tv.font = .systemFont(ofSize: 12)
+        tv.textColor = .labelColor
         tv.autoresizingMask = [.width]
         sv.documentView = tv
+        // высота окна под текст: короткий список — без прокрутки, длинный — до 300 pt
+        if let lm = tv.layoutManager, let tc = tv.textContainer {
+            lm.ensureLayout(for: tc)
+            let h = lm.usedRect(for: tc).height + 12
+            sv.frame.size.height = min(max(h, 60), 300)
+            tv.frame.size.height = max(h, sv.frame.height)
+        }
         a.accessoryView = sv
         a.addButton(withTitle: "Обновить")
         a.addButton(withTitle: "Позже")
